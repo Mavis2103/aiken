@@ -80,8 +80,8 @@ fn capabilities() -> lsp_types::ServerCapabilities {
             lsp_types::TextDocumentSyncOptions {
                 open_close: None,
                 change: Some(lsp_types::TextDocumentSyncKind::FULL),
-                will_save: None,
-                will_save_wait_until: None,
+                will_save: Some(true),
+                will_save_wait_until: Some(true),
                 save: Some(lsp_types::TextDocumentSyncSaveOptions::SaveOptions(
                     lsp_types::SaveOptions {
                         include_text: Some(false),

@@ -33,7 +33,7 @@ use lsp_types::{
     request::{
         CodeActionRequest, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest,
         InlayHintRequest, PrepareRenameRequest, References, Rename, Request,
-        WorkDoneProgressCreate,
+        WillSaveWaitUntil, WorkDoneProgressCreate,
     },
 };
 use miette::Diagnostic;
@@ -344,13 +344,7 @@ impl Server {
         }
     }
 
-    fn format(
-        &mut self,
-        params: DocumentFormattingParams,
-    ) -> Result<Vec<TextEdit>, Vec<ProjectError>> {
-        let path = params.text_document.uri.path();
-        let mut new_text = String::new();
-
+    fn format_src(&self, path: &str) -> Result<String, Vec<ProjectError>> {
         let src = match self.edited.get(path) {
             Some(src) => src.clone(),
             None => fs::read_to_string(path).map_err(|_| vec![])?,
@@ -360,8 +354,18 @@ impl Server {
             aiken_project::error::Error::from_parse_errors(errs, Path::new(path), &src)
         })?;
 
+        let mut new_text = String::new();
         aiken_lang::format::pretty(&mut new_text, module, extra, &src);
 
+        Ok(new_text)
+    }
+
+    fn format(
+        &mut self,
+        params: DocumentFormattingParams,
+    ) -> Result<Vec<TextEdit>, Vec<ProjectError>> {
+        let path = params.text_document.uri.path();
+        let new_text = self.format_src(path)?;
         Ok(vec![text_edit_replace(new_text)])
     }
 
@@ -452,6 +456,34 @@ impl Server {
 
                         self.publish_stored_diagnostics(connection)?;
 
+                        Ok(lsp_server::Response {
+                            id,
+                            error: None,
+                            result: Some(serde_json::json!(null)),
+                        })
+                    }
+                }
+            }
+
+            WillSaveWaitUntil::METHOD => {
+                let params = cast_request::<WillSaveWaitUntil>(request)?;
+
+                // Format the document before save so the saved file is clean
+                let path = params.text_document.uri.path();
+                let result = self.format_src(path);
+
+                match result {
+                    Ok(new_text) => {
+                        let edits = vec![text_edit_replace(new_text)];
+                        Ok(lsp_server::Response {
+                            id,
+                            error: None,
+                            result: Some(serde_json::to_value(Some(edits))?),
+                        })
+                    }
+                    Err(_) => {
+                        // If formatting fails (parse errors etc.), return null
+                        // so the client proceeds with save as-is
                         Ok(lsp_server::Response {
                             id,
                             error: None,
