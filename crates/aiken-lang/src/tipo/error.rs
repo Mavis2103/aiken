@@ -1925,15 +1925,15 @@ pub enum Warning {
 impl ExtraData for Warning {
     fn extra_data(&self) -> Option<String> {
         match self {
+            Warning::UnusedVariable { name, .. } => Some(name.clone()),
+            Warning::DiscardedLetAssignment { name, .. } => Some(name.clone()),
+            Warning::Todo { tipo, .. } => Some(tipo.to_pretty(0)),
+            Warning::SingleWhenClause { sample, .. } => Some(format_suggestion(sample)),
             Warning::AllFieldsRecordUpdate { .. }
             | Warning::ImplicitlyDiscardedResult { .. }
             | Warning::NoFieldsRecordUpdate { .. }
             | Warning::SingleConstructorExpect { .. }
-            | Warning::SingleWhenClause { .. }
-            | Warning::Todo { .. }
             | Warning::UnusedConstructor { .. }
-            | Warning::UnusedVariable { .. }
-            | Warning::DiscardedLetAssignment { .. }
             | Warning::ValidatorInLibraryModule { .. }
             | Warning::CompactTraceLabelIsNotstring { .. }
             | Warning::UseWhenInstead { .. } => None,

@@ -33,10 +33,10 @@ use lsp_types::{
         Notification, Progress, PublishDiagnostics, ShowMessage,
     },
     request::{
-        CodeActionRequest, Completion, DocumentSymbolRequest, Formatting, GotoDefinition,
-        HoverRequest, InlayHintRequest, PrepareRenameRequest, References, Rename, Request,
-        SelectionRangeRequest, SemanticTokensFullRequest, SignatureHelpRequest, WillSaveWaitUntil,
-        WorkDoneProgressCreate, WorkspaceSymbolRequest,
+        CodeActionRequest, CodeActionResolveRequest, Completion, DocumentSymbolRequest, Formatting,
+        GotoDefinition, HoverRequest, InlayHintRequest, PrepareRenameRequest, References, Rename,
+        Request, SelectionRangeRequest, SemanticTokensFullRequest, SignatureHelpRequest,
+        WillSaveWaitUntil, WorkDoneProgressCreate, WorkspaceSymbolRequest,
     },
 };
 use miette::Diagnostic;
@@ -169,14 +169,7 @@ fn process_diagnostic_into<E>(
         let lsp_diagnostic = lsp_types::Diagnostic {
             range: lsp_range,
             severity: Some(severity),
-            code: error.code().map(|c| {
-                lsp_types::NumberOrString::String(
-                    c.to_string()
-                        .trim()
-                        .replace("Warning ", "")
-                        .replace("Error ", ""),
-                )
-            }),
+            code: error.clean_code().map(lsp_types::NumberOrString::String),
             code_description: None,
             source: None,
             message,
@@ -587,6 +580,17 @@ impl Server {
                     id,
                     error: None,
                     result: Some(serde_json::to_value(actions)?),
+                })
+            }
+
+            CodeActionResolveRequest::METHOD => {
+                let action = cast_request::<CodeActionResolveRequest>(request)
+                    .expect("cast code action resolve request");
+
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(action)?),
                 })
             }
 
