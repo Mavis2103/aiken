@@ -54,8 +54,8 @@ use pallas_addresses::{Address, Network, ShelleyAddress, ShelleyDelegationPart, 
 use pallas_primitives::conway::PolicyId;
 use std::{
     collections::{BTreeSet, HashMap, HashSet, hash_map::DefaultHasher},
-    hash::{Hash, Hasher},
     fs::{self, File},
+    hash::{Hash, Hasher},
     io::BufReader,
     path::{Path, PathBuf},
     rc::Rc,
@@ -1002,30 +1002,32 @@ where
 
         modules.extends_glossary(&mut self.glossary);
 
-        let own_module_deps_map: HashMap<String, Vec<String>> =
-            if !self.own_module_hints.is_empty() {
-                let env_mods: Vec<String> = modules
-                    .values()
-                    .filter_map(|m| {
-                        if m.kind == ModuleKind::Env {
-                            Some(m.name.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                modules
-                    .values()
-                    .map(|m| {
-                        let (name, deps) = m.deps_for_graph(&env_mods);
-                        let own_deps: Vec<String> =
-                            deps.into_iter().filter(|d| our_modules.contains(d)).collect();
-                        (name, own_deps)
-                    })
-                    .collect()
-            } else {
-                HashMap::new()
-            };
+        let own_module_deps_map: HashMap<String, Vec<String>> = if !self.own_module_hints.is_empty()
+        {
+            let env_mods: Vec<String> = modules
+                .values()
+                .filter_map(|m| {
+                    if m.kind == ModuleKind::Env {
+                        Some(m.name.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            modules
+                .values()
+                .map(|m| {
+                    let (name, deps) = m.deps_for_graph(&env_mods);
+                    let own_deps: Vec<String> = deps
+                        .into_iter()
+                        .filter(|d| our_modules.contains(d))
+                        .collect();
+                    (name, own_deps)
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
 
         let mut cache_hit_modules: HashSet<String> = HashSet::new();
 
@@ -1035,8 +1037,7 @@ where
                     .get(&name)
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);
-                let all_deps_cache_hit =
-                    own_deps.iter().all(|d| cache_hit_modules.contains(d));
+                let all_deps_cache_hit = own_deps.iter().all(|d| cache_hit_modules.contains(d));
 
                 if all_deps_cache_hit {
                     let mut hasher = DefaultHasher::new();

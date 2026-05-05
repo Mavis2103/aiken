@@ -8,6 +8,7 @@ mod cast;
 mod edits;
 pub mod error;
 mod quickfix;
+mod rename;
 pub mod server;
 pub mod utils;
 
@@ -67,7 +68,14 @@ fn capabilities() -> lsp_types::ServerCapabilities {
         definition_provider: Some(lsp_types::OneOf::Left(true)),
         document_symbol_provider: Some(lsp_types::OneOf::Left(true)),
         references_provider: Some(lsp_types::OneOf::Left(true)),
+        rename_provider: Some(lsp_types::OneOf::Right(lsp_types::RenameOptions {
+            prepare_provider: Some(true),
+            work_done_progress_options: lsp_types::WorkDoneProgressOptions {
+                work_done_progress: None,
+            },
+        })),
         hover_provider: Some(lsp_types::HoverProviderCapability::Simple(true)),
+        inlay_hint_provider: Some(lsp_types::OneOf::Left(true)),
         text_document_sync: Some(lsp_types::TextDocumentSyncCapability::Options(
             lsp_types::TextDocumentSyncOptions {
                 open_close: None,

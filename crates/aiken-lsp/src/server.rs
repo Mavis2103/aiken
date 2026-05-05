@@ -5,12 +5,12 @@ use crate::{
     quickfix,
     quickfix::Quickfix,
     utils::{
-        path_to_uri, span_to_lsp_range, text_edit_replace, uri_to_module_name,
-        COMPILING_PROGRESS_TOKEN, CREATE_COMPILING_PROGRESS_TOKEN,
+        COMPILING_PROGRESS_TOKEN, CREATE_COMPILING_PROGRESS_TOKEN, path_to_uri, span_to_lsp_range,
+        text_edit_replace, uri_to_module_name,
     },
 };
 use aiken_lang::{
-    ast::{Definition, Located, ModuleKind, Span, TypedDefinition, Use},
+    ast::{Definition, Located, ModuleKind, Span, TypedDefinition},
     error::ExtraData,
     line_numbers::LineNumbers,
     parser,
@@ -22,18 +22,19 @@ use aiken_project::{
     module::CheckedModule,
 };
 use indoc::formatdoc;
-use itertools::Itertools;
+
 use lsp_server::Connection;
 use lsp_types::{
+    DocumentFormattingParams, DocumentSymbol, InitializeParams, SymbolKind, TextEdit,
     notification::{
         DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument, DidSaveTextDocument,
         Notification, Progress, PublishDiagnostics, ShowMessage,
     },
     request::{
-        CodeActionRequest, Completion, DocumentSymbolRequest, Formatting, GotoDefinition,
-        HoverRequest, References, Request, WorkDoneProgressCreate,
+        CodeActionRequest, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest,
+        InlayHintRequest, PrepareRenameRequest, References, Rename, Request,
+        WorkDoneProgressCreate,
     },
-    DocumentFormattingParams, DocumentSymbol, InitializeParams, SymbolKind, TextEdit,
 };
 use miette::Diagnostic;
 use std::{
@@ -42,6 +43,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub mod inlay_hints;
 pub mod lsp_project;
 pub mod telemetry;
 
@@ -55,14 +57,14 @@ struct BackgroundCompileResult {
 unsafe impl Send for BackgroundCompileResult {}
 
 /// Target symbol info for reference searching — enables scope-aware matching
-struct SymbolTarget {
-    name: String,
+pub(crate) struct SymbolTarget {
+    pub(crate) name: String,
     /// The module where this symbol is defined (None = local variable / unknown)
-    def_module: Option<String>,
+    pub(crate) def_module: Option<String>,
     /// Byte span of the definition site — used for precise disambiguation
-    def_span: Span,
+    pub(crate) def_span: Span,
     /// Module where lookup started — needed to disambiguate local variables
-    origin_module: String,
+    pub(crate) origin_module: String,
 }
 
 pub struct Server {
@@ -89,7 +91,7 @@ pub struct Server {
     stored_messages: Vec<lsp_types::ShowMessageParams>,
 
     /// An instance of a LspProject
-    compiler: Option<LspProject>,
+    pub(crate) compiler: Option<LspProject>,
 
     pending_compile: Option<std::thread::JoinHandle<BackgroundCompileResult>>,
 
@@ -483,18 +485,6 @@ impl Server {
                 })
             }
 
-            Completion::METHOD => {
-                let params = cast_request::<Completion>(request).expect("cast Completion");
-
-                let completions = self.completion(params);
-
-                Ok(lsp_server::Response {
-                    id,
-                    error: None,
-                    result: Some(serde_json::to_value(completions)?),
-                })
-            }
-
             CodeActionRequest::METHOD => {
                 let mut actions = Vec::new();
 
@@ -564,67 +554,46 @@ impl Server {
                 })
             }
 
+            PrepareRenameRequest::METHOD => {
+                let params = cast_request::<PrepareRenameRequest>(request)?;
+
+                let result = self.prepare_rename(params);
+
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
+            Rename::METHOD => {
+                let params = cast_request::<Rename>(request)?;
+
+                let result = self.rename(params);
+
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
+            InlayHintRequest::METHOD => {
+                let params = cast_request::<InlayHintRequest>(request)?;
+
+                let hints = self.inlay_hints(params);
+
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(hints)?),
+                })
+            }
+
             unsupported => Err(ServerError::UnsupportedLspRequest {
                 request: unsupported.to_string(),
             }),
         }
-    }
-
-    fn completion(
-        &self,
-        params: lsp_types::CompletionParams,
-    ) -> Option<Vec<lsp_types::CompletionItem>> {
-        let found = self
-            .node_at_position(&params.text_document_position)
-            .map(|(_, found)| found);
-
-        match found {
-            // TODO: test
-            None => self.completion_for_import(&[]),
-            Some(Located::Definition(Definition::Use(Use { module, .. }))) => {
-                self.completion_for_import(module)
-            }
-
-            // TODO: autocompletion for patterns
-            Some(Located::Pattern(_pattern, _value)) => None,
-
-            // TODO: autocompletion for other definitions
-            Some(Located::Definition(_expression)) => None,
-
-            // TODO: autocompletion for expressions
-            Some(Located::Expression(_expression)) => None,
-
-            // TODO: autocompletion for arguments?
-            Some(Located::Argument(_arg_name, _tipo)) => None,
-
-            // TODO: autocompletion for annotation?
-            Some(Located::Annotation(_annotation)) => None,
-        }
-    }
-
-    fn completion_for_import(&self, module: &[String]) -> Option<Vec<lsp_types::CompletionItem>> {
-        let compiler = self.compiler.as_ref()?;
-
-        // TODO: Test
-        let dependencies_modules = compiler.project.importable_modules();
-
-        // TODO: Test
-        let project_modules = compiler.modules.keys().cloned();
-
-        let modules = dependencies_modules
-            .into_iter()
-            .chain(project_modules)
-            .sorted()
-            .filter(|m| m.starts_with(&module.join("/")))
-            .map(|label| lsp_types::CompletionItem {
-                label,
-                kind: None,
-                documentation: None,
-                ..Default::default()
-            })
-            .collect();
-
-        Some(modules)
     }
 
     #[allow(clippy::result_large_err)]
@@ -657,8 +626,8 @@ impl Server {
                     None => return Ok(None),
                 };
 
-                let url = url::Url::from_file_path(&module.path)
-                    .expect("goto definition URL parse");
+                let url =
+                    url::Url::from_file_path(&module.path).expect("goto definition URL parse");
 
                 (url, &module.line_numbers)
             }
@@ -669,7 +638,7 @@ impl Server {
         Ok(Some(lsp_types::Location { uri, range }))
     }
 
-    fn node_at_position(
+    pub(crate) fn node_at_position(
         &self,
         params: &lsp_types::TextDocumentPositionParams,
     ) -> Option<(LineNumbers, Located<'_>)> {
@@ -687,7 +656,7 @@ impl Server {
         Some((line_numbers, node))
     }
 
-    fn module_for_uri(&self, uri: &url::Url) -> Option<&CheckedModule> {
+    pub(crate) fn module_for_uri(&self, uri: &url::Url) -> Option<&CheckedModule> {
         self.compiler.as_ref().and_then(|compiler| {
             let module_name = uri_to_module_name(uri, &self.root).expect("uri to module name");
             compiler.modules.get(&module_name)
@@ -810,7 +779,8 @@ impl Server {
 
         // Search through all modules for references to this symbol
         for (module_name, checked_module) in &compiler.modules {
-            if let Some(module_refs) = self.find_references_in_module(&target, checked_module, module_name)
+            if let Some(module_refs) =
+                self.find_references_in_module(&target, checked_module, module_name)
             {
                 references.extend(module_refs);
             }
@@ -990,7 +960,7 @@ impl Server {
     }
 
     /// Find the symbol target at the given position in a module
-    fn find_symbol_at_position(
+    pub(crate) fn find_symbol_at_position(
         &self,
         position: &lsp_types::Position,
         module: &CheckedModule,
@@ -1111,7 +1081,7 @@ impl Server {
     }
 
     /// Convert module name to URI
-    fn module_name_to_uri(&self, module_name: &str) -> Option<url::Url> {
+    pub(crate) fn module_name_to_uri(&self, module_name: &str) -> Option<url::Url> {
         if let Some(compiler) = &self.compiler
             && let Some(source) = compiler.sources.get(module_name)
         {
@@ -1121,7 +1091,7 @@ impl Server {
     }
 
     /// Find all references to a symbol in a module
-    fn find_references_in_module(
+    pub(crate) fn find_references_in_module(
         &self,
         target: &SymbolTarget,
         module: &CheckedModule,
@@ -1263,13 +1233,7 @@ impl Server {
                 }
             }
             aiken_lang::expr::TypedExpr::Call { fun, args, .. } => {
-                self.find_references_in_expr(
-                    target,
-                    fun,
-                    line_numbers,
-                    module_name,
-                    locations,
-                );
+                self.find_references_in_expr(target, fun, line_numbers, module_name, locations);
                 for arg in args {
                     self.find_references_in_expr(
                         target,
@@ -1282,12 +1246,24 @@ impl Server {
             }
             aiken_lang::expr::TypedExpr::Sequence { expressions, .. } => {
                 for expr in expressions {
-                    self.find_references_in_expr(target, expr, line_numbers, module_name, locations);
+                    self.find_references_in_expr(
+                        target,
+                        expr,
+                        line_numbers,
+                        module_name,
+                        locations,
+                    );
                 }
             }
             aiken_lang::expr::TypedExpr::Pipeline { expressions, .. } => {
                 for expr in expressions.iter() {
-                    self.find_references_in_expr(target, expr, line_numbers, module_name, locations);
+                    self.find_references_in_expr(
+                        target,
+                        expr,
+                        line_numbers,
+                        module_name,
+                        locations,
+                    );
                 }
             }
             aiken_lang::expr::TypedExpr::Fn { body, .. } => {
@@ -1295,11 +1271,23 @@ impl Server {
             }
             aiken_lang::expr::TypedExpr::List { elements, tail, .. } => {
                 for elem in elements {
-                    self.find_references_in_expr(target, elem, line_numbers, module_name, locations);
+                    self.find_references_in_expr(
+                        target,
+                        elem,
+                        line_numbers,
+                        module_name,
+                        locations,
+                    );
                 }
 
                 if let Some(tail) = tail {
-                    self.find_references_in_expr(target, tail, line_numbers, module_name, locations);
+                    self.find_references_in_expr(
+                        target,
+                        tail,
+                        line_numbers,
+                        module_name,
+                        locations,
+                    );
                 }
             }
             aiken_lang::expr::TypedExpr::BinOp { left, right, .. } => {
@@ -1364,7 +1352,13 @@ impl Server {
             }
             aiken_lang::expr::TypedExpr::Tuple { elems, .. } => {
                 for elem in elems {
-                    self.find_references_in_expr(target, elem, line_numbers, module_name, locations);
+                    self.find_references_in_expr(
+                        target,
+                        elem,
+                        line_numbers,
+                        module_name,
+                        locations,
+                    );
                 }
             }
             aiken_lang::expr::TypedExpr::Pair { fst, snd, .. } => {
@@ -1638,7 +1632,11 @@ fn collect_pattern_vars(
                 children: None,
             });
         }
-        Pattern::Assign { name, location, pattern } => {
+        Pattern::Assign {
+            name,
+            location,
+            pattern,
+        } => {
             let range = span_to_lsp_range(*location, line_numbers);
             #[allow(deprecated)]
             vars.push(DocumentSymbol {
@@ -1688,7 +1686,12 @@ fn collect_let_vars(
     use aiken_lang::expr::TypedExpr;
 
     match expr {
-        TypedExpr::Assignment { pattern, kind, value, .. } => {
+        TypedExpr::Assignment {
+            pattern,
+            kind,
+            value,
+            ..
+        } => {
             match kind {
                 AssignmentKind::Let { .. } | AssignmentKind::Expect { .. } => {
                     collect_pattern_vars(pattern, line_numbers, vars);
@@ -1702,7 +1705,11 @@ fn collect_let_vars(
                 collect_let_vars(e, line_numbers, vars);
             }
         }
-        TypedExpr::If { branches, final_else, .. } => {
+        TypedExpr::If {
+            branches,
+            final_else,
+            ..
+        } => {
             for branch in branches.iter() {
                 if let Some((is_pattern, _)) = &branch.is {
                     collect_pattern_vars(is_pattern, line_numbers, vars);
@@ -1711,7 +1718,9 @@ fn collect_let_vars(
             }
             collect_let_vars(final_else, line_numbers, vars);
         }
-        TypedExpr::When { subject, clauses, .. } => {
+        TypedExpr::When {
+            subject, clauses, ..
+        } => {
             collect_let_vars(subject, line_numbers, vars);
             for clause in clauses {
                 collect_let_vars(&clause.then, line_numbers, vars);
