@@ -32,8 +32,8 @@ use lsp_types::{
     },
     request::{
         CodeActionRequest, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest,
-        InlayHintRequest, PrepareRenameRequest, References, Rename, Request,
-        WillSaveWaitUntil, WorkDoneProgressCreate,
+        InlayHintRequest, PrepareRenameRequest, References, Rename, Request, WillSaveWaitUntil,
+        WorkDoneProgressCreate,
     },
 };
 use miette::Diagnostic;
@@ -97,6 +97,9 @@ pub struct Server {
 
     /// Files changed since last successful compilation (used to avoid no-op compiles)
     files_changed_since_compile: HashSet<String>,
+
+    /// Timestamp of last DidChange notification for debouncing live diagnostics
+    last_change: Option<std::time::Instant>,
 }
 
 fn process_diagnostic_into<E>(
@@ -263,12 +266,17 @@ impl Server {
         let _ = self.pending_compile.take();
         if let Some(config) = self.config.clone() {
             let root = self.root.clone();
+            let edited = self.edited.clone();
             let dep_cache = self
                 .compiler
                 .as_ref()
                 .map(|c| c.dep_cache().clone())
                 .unwrap_or_default();
             let handle = std::thread::spawn(move || {
+                // Apply unsaved edits before compiling so diagnostics match
+                // the in-editor content. Files are restored after compile.
+                let _guard = EditedFileGuard::new(&edited);
+
                 let mut compiler =
                     LspProject::new_with_cache(config, root, telemetry::Lsp, dep_cache);
                 let result = compiler.compile();
@@ -300,15 +308,25 @@ impl Server {
             .as_ref()
             .map(|h| h.is_finished())
             .unwrap_or(false);
-        if finished
-            && let Some(handle) = self.pending_compile.take()
-            && let Ok(result) = handle.join()
-        {
-            self.compiler = Some(result.compiler);
-            self.files_changed_since_compile.clear();
-            self.stored_diagnostics = result.stored_diagnostics;
-            self.stored_messages = result.stored_messages;
-            self.notify_client_of_compilation_end(connection)?;
+        if finished && let Some(handle) = self.pending_compile.take() {
+            match handle.join() {
+                Ok(result) => {
+                    self.compiler = Some(result.compiler);
+                    self.files_changed_since_compile.clear();
+                    self.stored_diagnostics = result.stored_diagnostics;
+                    self.stored_messages = result.stored_messages;
+                    self.notify_client_of_compilation_end(connection)?;
+                }
+                Err(_) => {
+                    tracing::error!("Background compilation thread panicked");
+                    // Keep files_changed_since_compile so next save retries
+                    self.stored_messages.push(lsp_types::ShowMessageParams {
+                        typ: lsp_types::MessageType::ERROR,
+                        message: "Background compilation crashed — please save again to retry"
+                            .to_string(),
+                    });
+                }
+            }
             self.publish_stored_diagnostics(connection)?;
         }
         Ok(())
@@ -393,6 +411,7 @@ impl Server {
                 if let Some(changes) = params.content_changes.into_iter().next() {
                     self.edited.insert(path.clone(), changes.text);
                     self.files_changed_since_compile.insert(path);
+                    self.last_change = Some(std::time::Instant::now());
                 }
                 Ok(())
             }
@@ -533,8 +552,12 @@ impl Server {
                                 unused_imports.extend(diagnostics);
                             }
                             Some(strategy) => {
-                                let quickfixes =
-                                    quickfix::quickfix(compiler, &params.text_document, &strategy);
+                                let quickfixes = quickfix::quickfix(
+                                    compiler,
+                                    &params.text_document,
+                                    &strategy,
+                                    &self.edited,
+                                );
                                 actions.extend(quickfixes);
                             }
                         }
@@ -550,6 +573,7 @@ impl Server {
                             compiler,
                             &params.text_document,
                             &Quickfix::UnusedImports(unused_imports),
+                            &self.edited,
                         );
                         actions.extend(quickfixes);
                     }
@@ -1430,6 +1454,7 @@ impl Server {
 
         loop {
             self.poll_compile_result(&connection)?;
+            self.try_debounced_compile(&connection)?;
             match connection
                 .receiver
                 .recv_timeout(std::time::Duration::from_millis(50))
@@ -1455,6 +1480,21 @@ impl Server {
         }
     }
 
+    /// Start a compile if enough time has passed since the last DidChange.
+    /// Uses a 300ms debounce to avoid recompiling on every keystroke.
+    #[allow(clippy::result_large_err)]
+    fn try_debounced_compile(&mut self, connection: &Connection) -> Result<(), ServerError> {
+        const DEBOUNCE_MS: u64 = 300;
+        if let Some(last) = self.last_change
+            && last.elapsed() >= std::time::Duration::from_millis(DEBOUNCE_MS)
+        {
+            self.last_change = None;
+            self.notify_client_of_compilation_start(connection)?;
+            self.spawn_compile();
+        }
+        Ok(())
+    }
+
     pub fn new(
         initialize_params: InitializeParams,
         config: Option<config::ProjectConfig>,
@@ -1471,6 +1511,7 @@ impl Server {
             compiler: None,
             pending_compile: None,
             files_changed_since_compile: HashSet::new(),
+            last_change: None,
         };
 
         server.create_new_compiler();
@@ -1706,6 +1747,36 @@ fn collect_pattern_vars(
             }
         }
         _ => {}
+    }
+}
+
+/// Writes edited (unsaved) file content to disk before compilation and restores
+/// the original content after compilation (even on panic).
+struct EditedFileGuard {
+    backups: Vec<(PathBuf, String)>,
+}
+
+impl EditedFileGuard {
+    fn new(edited: &HashMap<String, String>) -> Self {
+        let mut backups = Vec::new();
+        for (file_path, content) in edited {
+            let path = PathBuf::from(file_path);
+            if let Ok(original) = fs::read_to_string(&path)
+                && &original != content
+            {
+                let _ = fs::write(&path, content);
+                backups.push((path, original));
+            }
+        }
+        EditedFileGuard { backups }
+    }
+}
+
+impl Drop for EditedFileGuard {
+    fn drop(&mut self) {
+        for (path, original) in &self.backups {
+            let _ = fs::write(path, original);
+        }
     }
 }
 

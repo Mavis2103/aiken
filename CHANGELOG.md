@@ -19,6 +19,12 @@
 
 ### Fixed
 
+- **aiken-lsp**: Fix `path_to_uri` using manual string concatenation — replaced with `Url::from_file_path()` to produce properly encoded URIs.
+- **aiken-lsp**: Handle background compilation thread panics gracefully — preserve `files_changed_since_compile` so the next save retries, and show an error message instead of silently losing diagnostics.
+- **aiken-lsp**: Fix `publish_stored_diagnostics` always being called after compile (even on thread panic) so the client always receives diagnostic updates.
+- **aiken-lsp**: Fix `parse_document` reading from disk during code actions — now uses in-editor content from the `edited` map when available, so quickfixes apply to the correct positions.
+- **aiken-lsp**: Add 300ms debounced compile on `DidChangeTextDocument` — diagnostics now update live while typing, matching Python/TypeScript LSP behavior.
+- **aiken-lsp**: Add `EditedFileGuard` — temporarily writes unsaved edits to disk before compilation and restores originals after (even on panic), so diagnostics reflect the current editor content.
 - **uplc**: Fixed conversion/discrepancy from large negative bigint when using `Data::integer`; mostly impacting value reification and tracing of large negative integers. Fixes [#1241](https://github.com/aiken-lang/aiken/issues/1241). @KtorZ
 - **uplc**: Make evaluation failures language-dependent; thus allowing V1 & V2 evaluations to return non-unit results. @michaeljfazio, @KtorZ
 - **aiken-lang**: Improve/fix formatter on assignments, in particular multiline ones. @KtorZ

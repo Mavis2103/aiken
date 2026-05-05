@@ -107,10 +107,11 @@ pub fn quickfix(
     compiler: &LspProject,
     text_document: &lsp_types::TextDocumentIdentifier,
     quickfix: &Quickfix,
+    edited: &HashMap<String, String>,
 ) -> Vec<lsp_types::CodeAction> {
     let mut actions = Vec::new();
 
-    if let Some(ref parsed_document) = edits::parse_document(text_document) {
+    if let Some(ref parsed_document) = edits::parse_document(text_document, edited) {
         match quickfix {
             Quickfix::UnknownIdentifier(diagnostic) => {
                 each_as_distinct_action(
