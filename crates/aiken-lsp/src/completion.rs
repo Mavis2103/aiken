@@ -69,7 +69,7 @@ fn completion_for_import(
     module: &[String],
 ) -> Vec<CompletionItem> {
     let project_modules = local_modules.keys().cloned();
-    let modules = dependency_modules
+    dependency_modules
         .into_iter()
         .chain(project_modules)
         .sorted()
@@ -80,9 +80,7 @@ fn completion_for_import(
             documentation: None,
             ..Default::default()
         })
-        .collect();
-
-    modules
+        .collect()
 }
 
 /// Generate completions for expressions: in-scope values + module names for qualified access
@@ -423,10 +421,10 @@ fn format_insert_text(name: &str, variant: &ValueConstructorVariant) -> String {
 /// Returns true if the name looks like an auto-generated ordinal argument name (e.g. "1st_arg")
 fn is_ordinal_argument_name(name: &str) -> bool {
     // Pattern: starts with digit, contains "st_arg" or "nd_arg" or "rd_arg" or "th_arg"
-    if let Some(first_char) = name.chars().next() {
-        if first_char.is_ascii_digit() {
-            return name.ends_with("_arg");
-        }
+    if let Some(first_char) = name.chars().next()
+        && first_char.is_ascii_digit()
+    {
+        return name.ends_with("_arg");
     }
     false
 }

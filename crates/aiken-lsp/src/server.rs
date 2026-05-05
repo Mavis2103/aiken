@@ -4,6 +4,7 @@ use crate::{
     error::Error as ServerError,
     quickfix,
     quickfix::Quickfix,
+    semantic_tokens, signature_help,
     utils::{
         COMPILING_PROGRESS_TOKEN, CREATE_COMPILING_PROGRESS_TOKEN, path_to_uri, span_to_lsp_range,
         text_edit_replace, uri_to_module_name,
@@ -25,15 +26,17 @@ use indoc::formatdoc;
 
 use lsp_server::Connection;
 use lsp_types::{
-    DocumentFormattingParams, DocumentSymbol, InitializeParams, SymbolKind, TextEdit,
+    DocumentFormattingParams, DocumentSymbol, InitializeParams, SemanticToken, SemanticTokens,
+    SemanticTokensResult, SymbolKind, TextEdit,
     notification::{
         DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument, DidSaveTextDocument,
         Notification, Progress, PublishDiagnostics, ShowMessage,
     },
     request::{
-        CodeActionRequest, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest,
-        InlayHintRequest, PrepareRenameRequest, References, Rename, Request, WillSaveWaitUntil,
-        WorkDoneProgressCreate,
+        CodeActionRequest, Completion, DocumentSymbolRequest, Formatting, GotoDefinition,
+        HoverRequest, InlayHintRequest, PrepareRenameRequest, References, Rename, Request,
+        SelectionRangeRequest, SemanticTokensFullRequest, SignatureHelpRequest, WillSaveWaitUntil,
+        WorkDoneProgressCreate, WorkspaceSymbolRequest,
     },
 };
 use miette::Diagnostic;
@@ -46,6 +49,7 @@ use std::{
 pub mod inlay_hints;
 pub mod lsp_project;
 pub mod telemetry;
+pub mod workspace_symbol;
 
 /// Result returned from background compilation thread
 struct BackgroundCompileResult {
@@ -646,6 +650,84 @@ impl Server {
                 })
             }
 
+            Completion::METHOD => {
+                let params = cast_request::<Completion>(request)?;
+
+                let result = self.completion(params);
+
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
+            WorkspaceSymbolRequest::METHOD => {
+                let params = cast_request::<WorkspaceSymbolRequest>(request)?;
+
+                let result = self.workspace_symbol(params.query);
+
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
+            SignatureHelpRequest::METHOD => {
+                let params = cast_request::<SignatureHelpRequest>(request)?;
+
+                let result = signature_help::signature_help(self, params);
+
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
+            SemanticTokensFullRequest::METHOD => {
+                let params = cast_request::<SemanticTokensFullRequest>(request)?;
+
+                let result = self
+                    .module_for_uri(&params.text_document.uri)
+                    .map(|module| {
+                        let raw = semantic_tokens::semantic_tokens_full(module);
+                        let tokens: Vec<SemanticToken> = raw
+                            .chunks_exact(5)
+                            .map(|c| SemanticToken {
+                                delta_line: c[0],
+                                delta_start: c[1],
+                                length: c[2],
+                                token_type: c[3],
+                                token_modifiers_bitset: c[4],
+                            })
+                            .collect();
+                        SemanticTokensResult::Tokens(SemanticTokens {
+                            result_id: None,
+                            data: tokens,
+                        })
+                    });
+
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
+            SelectionRangeRequest::METHOD => {
+                let params = cast_request::<SelectionRangeRequest>(request)?;
+
+                let result = self.selection_range(params)?;
+
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
             unsupported => Err(ServerError::UnsupportedLspRequest {
                 request: unsupported.to_string(),
             }),
@@ -795,7 +877,8 @@ impl Server {
 
         // Extract symbols from module definitions
         for definition in &module.ast.definitions {
-            if let Some(symbol) = self.definition_to_symbol(definition, &line_numbers) {
+            if let Some(symbol) = self.definition_to_symbol(definition, &line_numbers, &module.code)
+            {
                 symbols.push(symbol);
             }
         }
@@ -858,22 +941,61 @@ impl Server {
         Ok(Some(references))
     }
 
+    #[allow(clippy::result_large_err)]
+    fn selection_range(
+        &self,
+        params: lsp_types::SelectionRangeParams,
+    ) -> Result<Option<Vec<lsp_types::SelectionRange>>, ServerError> {
+        let module = match self.module_for_uri(&params.text_document.uri) {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        let line_numbers = aiken_lang::line_numbers::LineNumbers::new(&module.code);
+        let source = &module.code;
+        let mut ranges = Vec::new();
+
+        for position in params.positions {
+            let byte_index =
+                line_numbers.byte_index(position.line as usize, position.character as usize);
+            if let Some(node) = module.find_node(byte_index) {
+                let range = build_selection_range(&node, &line_numbers, source);
+                ranges.push(range);
+            }
+        }
+
+        Ok(if ranges.is_empty() {
+            None
+        } else {
+            Some(ranges)
+        })
+    }
+
     /// Convert an Aiken definition to LSP DocumentSymbol
     #[allow(deprecated)]
     fn definition_to_symbol(
         &self,
         definition: &TypedDefinition,
         line_numbers: &LineNumbers,
+        source: &str,
     ) -> Option<DocumentSymbol> {
         use aiken_lang::ast::Definition;
 
-        // TODO: selection_range should ideally cover only the name identifier, not the full definition
-        // The AST currently doesn't store a separate name span
+        /// Helper to narrow a span to just the identifier name
+        fn identifier_span(source: &str, span: Span, name: &str) -> Option<Span> {
+            let text = &source[span.start..span.end];
+            let offset = text.find(name)?;
+            Some(Span {
+                start: span.start + offset,
+                end: span.start + offset + name.len(),
+            })
+        }
 
         match definition {
             Definition::Fn(function) => {
                 let range = span_to_lsp_range(function.location, line_numbers);
-                let selection_range = span_to_lsp_range(function.location, line_numbers);
+                let selection_range = identifier_span(source, function.location, &function.name)
+                    .map(|s| span_to_lsp_range(s, line_numbers))
+                    .unwrap_or_else(|| span_to_lsp_range(function.location, line_numbers));
 
                 let mut vars = Vec::new();
                 collect_let_vars(&function.body, line_numbers, &mut vars);
@@ -891,7 +1013,9 @@ impl Server {
             }
             Definition::Test(test) => {
                 let range = span_to_lsp_range(test.location, line_numbers);
-                let selection_range = span_to_lsp_range(test.location, line_numbers);
+                let selection_range = identifier_span(source, test.location, &test.name)
+                    .map(|s| span_to_lsp_range(s, line_numbers))
+                    .unwrap_or_else(|| span_to_lsp_range(test.location, line_numbers));
 
                 let mut vars = Vec::new();
                 collect_let_vars(&test.body, line_numbers, &mut vars);
@@ -909,7 +1033,9 @@ impl Server {
             }
             Definition::Benchmark(benchmark) => {
                 let range = span_to_lsp_range(benchmark.location, line_numbers);
-                let selection_range = span_to_lsp_range(benchmark.location, line_numbers);
+                let selection_range = identifier_span(source, benchmark.location, &benchmark.name)
+                    .map(|s| span_to_lsp_range(s, line_numbers))
+                    .unwrap_or_else(|| span_to_lsp_range(benchmark.location, line_numbers));
 
                 let mut vars = Vec::new();
                 collect_let_vars(&benchmark.body, line_numbers, &mut vars);
@@ -927,7 +1053,10 @@ impl Server {
             }
             Definition::TypeAlias(type_alias) => {
                 let range = span_to_lsp_range(type_alias.location, line_numbers);
-                let selection_range = span_to_lsp_range(type_alias.location, line_numbers);
+                let selection_range =
+                    identifier_span(source, type_alias.location, &type_alias.alias)
+                        .map(|s| span_to_lsp_range(s, line_numbers))
+                        .unwrap_or_else(|| span_to_lsp_range(type_alias.location, line_numbers));
 
                 Some(DocumentSymbol {
                     name: type_alias.alias.clone(),
@@ -942,14 +1071,20 @@ impl Server {
             }
             Definition::DataType(data_type) => {
                 let range = span_to_lsp_range(data_type.location, line_numbers);
-                let selection_range = span_to_lsp_range(data_type.location, line_numbers);
+                let selection_range = identifier_span(source, data_type.location, &data_type.name)
+                    .map(|s| span_to_lsp_range(s, line_numbers))
+                    .unwrap_or_else(|| span_to_lsp_range(data_type.location, line_numbers));
 
                 // Create child symbols for constructors
                 let mut children = Vec::new();
                 for constructor in &data_type.constructors {
                     let constructor_range = span_to_lsp_range(constructor.location, line_numbers);
                     let constructor_selection_range =
-                        span_to_lsp_range(constructor.location, line_numbers);
+                        identifier_span(source, constructor.location, &constructor.name)
+                            .map(|s| span_to_lsp_range(s, line_numbers))
+                            .unwrap_or_else(|| {
+                                span_to_lsp_range(constructor.location, line_numbers)
+                            });
 
                     children.push(DocumentSymbol {
                         name: constructor.name.clone(),
@@ -980,7 +1115,9 @@ impl Server {
             }
             Definition::ModuleConstant(constant) => {
                 let range = span_to_lsp_range(constant.location, line_numbers);
-                let selection_range = span_to_lsp_range(constant.location, line_numbers);
+                let selection_range = identifier_span(source, constant.location, &constant.name)
+                    .map(|s| span_to_lsp_range(s, line_numbers))
+                    .unwrap_or_else(|| span_to_lsp_range(constant.location, line_numbers));
 
                 Some(DocumentSymbol {
                     name: constant.name.clone(),
@@ -995,7 +1132,9 @@ impl Server {
             }
             Definition::Validator(validator) => {
                 let range = span_to_lsp_range(validator.location, line_numbers);
-                let selection_range = span_to_lsp_range(validator.location, line_numbers);
+                let selection_range = identifier_span(source, validator.location, &validator.name)
+                    .map(|s| span_to_lsp_range(s, line_numbers))
+                    .unwrap_or_else(|| span_to_lsp_range(validator.location, line_numbers));
 
                 Some(DocumentSymbol {
                     name: validator.name.clone(),
@@ -1876,5 +2015,70 @@ fn collect_let_vars(
             collect_let_vars(value, line_numbers, vars);
         }
         _ => {}
+    }
+}
+
+fn build_selection_range(
+    node: &Located<'_>,
+    line_numbers: &LineNumbers,
+    source: &str,
+) -> lsp_types::SelectionRange {
+    use aiken_lang::ast::Span;
+
+    fn name_span(source: &str, span: Span, name: &str) -> Option<Span> {
+        let text = &source[span.start..span.end];
+        let offset = text.find(name)?;
+        Some(Span {
+            start: span.start + offset,
+            end: span.start + offset + name.len(),
+        })
+    }
+
+    let (full_span, def_name) = match node {
+        Located::Definition(def) => {
+            use aiken_lang::ast::Definition;
+            let name = match def {
+                Definition::Fn(f) => Some(&f.name[..]),
+                Definition::DataType(dt) => Some(&dt.name[..]),
+                Definition::TypeAlias(ta) => Some(&ta.alias[..]),
+                Definition::ModuleConstant(c) => Some(&c.name[..]),
+                Definition::Validator(v) => Some(&v.name[..]),
+                Definition::Test(t) => Some(&t.name[..]),
+                Definition::Benchmark(b) => Some(&b.name[..]),
+                Definition::Use(_) => None,
+            };
+            (def.location(), name)
+        }
+        Located::Expression(expr) => {
+            use aiken_lang::expr::TypedExpr;
+            let name = match expr {
+                TypedExpr::Var { name, .. } => Some(name.as_str()),
+                _ => None,
+            };
+            (expr.location(), name)
+        }
+        Located::Pattern(pat, _) => (pat.location(), None),
+        Located::Argument(arg, _) => (arg.location(), None),
+        Located::Annotation(ann) => (ann.location(), None),
+    };
+
+    let full_range = span_to_lsp_range(full_span, line_numbers);
+
+    if let Some(name) = def_name
+        && let Some(name_span) = name_span(source, full_span, name)
+    {
+        let name_range = span_to_lsp_range(name_span, line_numbers);
+        lsp_types::SelectionRange {
+            range: name_range,
+            parent: Some(Box::new(lsp_types::SelectionRange {
+                range: full_range,
+                parent: None,
+            })),
+        }
+    } else {
+        lsp_types::SelectionRange {
+            range: full_range,
+            parent: None,
+        }
     }
 }
