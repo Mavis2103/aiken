@@ -4,7 +4,7 @@ use aiken_lang::{
     line_numbers::LineNumbers,
 };
 use itertools::Itertools;
-use std::fs;
+use std::{collections::HashMap, fs};
 
 /// A freshly parsed module alongside its line numbers.
 pub struct ParsedDocument {
@@ -20,13 +20,20 @@ pub enum AnnotatedEdit {
 
 /// Parse the target document as an 'UntypedModule' alongside its line numbers. This is useful in
 /// case we need to manipulate the AST for a quickfix.
-pub fn parse_document(document: &lsp_types::TextDocumentIdentifier) -> Option<ParsedDocument> {
+/// If the document has unsaved edits (in the `edited` map), those are used instead of disk content.
+pub fn parse_document(
+    document: &lsp_types::TextDocumentIdentifier,
+    edited: &HashMap<String, String>,
+) -> Option<ParsedDocument> {
     let file_path = document
         .uri
         .to_file_path()
         .expect("invalid text document uri?");
 
-    let source_code = fs::read_to_string(file_path).ok()?;
+    let source_code = match edited.get(file_path.to_str()?) {
+        Some(content) => content.clone(),
+        None => fs::read_to_string(&file_path).ok()?,
+    };
 
     let line_numbers = LineNumbers::new(&source_code);
 

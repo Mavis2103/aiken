@@ -29,4 +29,7 @@ pub enum Error {
     #[error(transparent)]
     #[diagnostic(code(aiken::lsp::send))]
     PathToUri(#[from] url::ParseError),
+    #[error("Failed to convert path to URI: {0}")]
+    #[diagnostic(code(aiken::lsp::uri))]
+    UriError(String),
 }

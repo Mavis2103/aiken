@@ -44,7 +44,6 @@ impl fmt::Display for TomlLoadingContext {
     }
 }
 
-#[allow(dead_code)]
 #[derive(thiserror::Error)]
 pub enum Error {
     #[error("I just found two modules with the same name: '{}'", module.if_supports_color(Stderr, |s| s.yellow()))]
@@ -377,6 +376,9 @@ impl ExtraData for Error {
 pub trait GetSource {
     fn path(&self) -> Option<PathBuf>;
     fn src(&self) -> Option<String>;
+    fn clean_code(&self) -> Option<String> {
+        None
+    }
 }
 
 impl GetSource for Error {
@@ -436,6 +438,10 @@ impl GetSource for Error {
                 Some(src.to_string())
             }
         }
+    }
+
+    fn clean_code(&self) -> Option<String> {
+        self.clean_code()
     }
 }
 
@@ -682,6 +688,27 @@ impl Diagnostic for Error {
     }
 }
 
+impl Error {
+    pub fn clean_code(&self) -> Option<String> {
+        match self {
+            Error::Type { error, .. } => Some(format!(
+                "aiken::check{}",
+                error.code().map(|s| format!("::{s}")).unwrap_or_default()
+            )),
+            Error::DuplicateModule { .. } => Some("aiken::module::duplicate".into()),
+            Error::ImportCycle { .. } => Some("aiken::module::cyclical".into()),
+            Error::Parse { .. } => Some("aiken::parser".into()),
+            Error::Blueprint(e) => e.code().map(|c| c.to_string()),
+            Error::TomlLoading { .. } => Some("aiken::loading::toml".into()),
+            Error::Http(_) => Some("aiken::packages::download".into()),
+            Error::UnknownPackageVersion { .. } => Some("aiken::packages::resolve".into()),
+            Error::UnableToResolvePackage { .. } => Some("aiken::package::download".into()),
+            Error::Module(e) => e.code().map(|c| c.to_string()),
+            _ => None,
+        }
+    }
+}
+
 #[derive(thiserror::Error)]
 #[allow(clippy::large_enum_variant)]
 pub enum Warning {
@@ -743,6 +770,10 @@ impl GetSource for Warning {
             | Warning::CompilerVersionMismatch { .. }
             | Warning::SuspiciousTestMatch { .. } => None,
         }
+    }
+
+    fn clean_code(&self) -> Option<String> {
+        self.clean_code()
     }
 }
 
@@ -833,6 +864,27 @@ impl Warning {
 
     pub fn report(&self) {
         eprintln!("{self:?}")
+    }
+
+    pub fn clean_code(&self) -> Option<String> {
+        match self {
+            Warning::Type { warning, .. } => Some(format!(
+                "aiken::check{}",
+                warning.code().map(|s| format!("::{s}")).unwrap_or_default()
+            )),
+            Warning::NoValidators => Some("aiken::check".into()),
+            Warning::InvalidModuleName { .. } => Some("aiken::project::module_name".into()),
+            Warning::CompilerVersionMismatch { .. } => {
+                Some("aiken::project::compiler_version_mismatch".into())
+            }
+            Warning::DependencyAlreadyExists { .. } => {
+                Some("aiken::packages::already_exists".into())
+            }
+            Warning::NoConfigurationForEnv { .. } => {
+                Some("aiken::project::config::missing::env".into())
+            }
+            Warning::SuspiciousTestMatch { .. } => Some("aiken::check::suspicious_match".into()),
+        }
     }
 }
 

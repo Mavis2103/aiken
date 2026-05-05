@@ -1,11 +1,11 @@
 use aiken_lang::tipo::TypeInfo;
 use aiken_lang::{ast::Tracing, line_numbers::LineNumbers, test_framework::PropertyTest};
 use aiken_project::{
-    config::ProjectConfig, error::Error as ProjectError, module::CheckedModule,
-    telemetry::CoverageMode, Project,
+    Project, config::ProjectConfig, error::Error as ProjectError, module::CheckedModule,
+    telemetry::CoverageMode,
 };
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap},
+    collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     path::PathBuf,
 };
@@ -92,6 +92,10 @@ impl LspProject {
 
     pub fn dep_cache(&self) -> &LspDepCache {
         &self.dep_cache
+    }
+
+    pub fn own_package(&self) -> &str {
+        &self.own_package
     }
 
     pub fn compile(&mut self) -> Result<(), Vec<ProjectError>> {

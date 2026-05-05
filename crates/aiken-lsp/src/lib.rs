@@ -5,10 +5,14 @@ use lsp_server::Connection;
 use std::env;
 
 mod cast;
+mod completion;
 mod edits;
 pub mod error;
 mod quickfix;
+mod rename;
+mod semantic_tokens;
 pub mod server;
+mod signature_help;
 pub mod utils;
 
 #[allow(clippy::result_large_err)]
@@ -53,27 +57,63 @@ pub fn start() -> Result<(), Error> {
 
 fn capabilities() -> lsp_types::ServerCapabilities {
     lsp_types::ServerCapabilities {
-        // THIS IS STILL WEIRD, ONLY ENABLE IF DEVELOPING
-        // completion_provider: Some(lsp_types::CompletionOptions {
-        //     resolve_provider: None,
-        //     trigger_characters: Some(vec![".".into(), " ".into()]),
-        //     all_commit_characters: None,
-        //     work_done_progress_options: lsp_types::WorkDoneProgressOptions {
-        //         work_done_progress: None,
-        //     },
-        // }),
-        code_action_provider: Some(lsp_types::CodeActionProviderCapability::Simple(true)),
+        completion_provider: Some(lsp_types::CompletionOptions {
+            resolve_provider: None,
+            trigger_characters: Some(vec![".".into(), " ".into()]),
+            all_commit_characters: None,
+            completion_item: None,
+            work_done_progress_options: lsp_types::WorkDoneProgressOptions {
+                work_done_progress: None,
+            },
+        }),
+        code_action_provider: Some(lsp_types::CodeActionProviderCapability::Options(
+            lsp_types::CodeActionOptions {
+                code_action_kinds: Some(vec![lsp_types::CodeActionKind::QUICKFIX]),
+                resolve_provider: Some(true),
+                work_done_progress_options: lsp_types::WorkDoneProgressOptions {
+                    work_done_progress: None,
+                },
+            },
+        )),
         document_formatting_provider: Some(lsp_types::OneOf::Left(true)),
         definition_provider: Some(lsp_types::OneOf::Left(true)),
         document_symbol_provider: Some(lsp_types::OneOf::Left(true)),
         references_provider: Some(lsp_types::OneOf::Left(true)),
+        selection_range_provider: Some(lsp_types::SelectionRangeProviderCapability::Simple(true)),
+        rename_provider: Some(lsp_types::OneOf::Right(lsp_types::RenameOptions {
+            prepare_provider: Some(true),
+            work_done_progress_options: lsp_types::WorkDoneProgressOptions {
+                work_done_progress: None,
+            },
+        })),
         hover_provider: Some(lsp_types::HoverProviderCapability::Simple(true)),
+        inlay_hint_provider: Some(lsp_types::OneOf::Left(true)),
+        semantic_tokens_provider: Some(
+            lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(
+                lsp_types::SemanticTokensOptions {
+                    legend: semantic_tokens::semantic_tokens_legend(),
+                    range: Some(true),
+                    full: Some(lsp_types::SemanticTokensFullOptions::Bool(true)),
+                    work_done_progress_options: lsp_types::WorkDoneProgressOptions {
+                        work_done_progress: None,
+                    },
+                },
+            ),
+        ),
+        workspace_symbol_provider: Some(lsp_types::OneOf::Left(true)),
+        signature_help_provider: Some(lsp_types::SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".into(), ",".into()]),
+            retrigger_characters: Some(vec![",".into()]),
+            work_done_progress_options: lsp_types::WorkDoneProgressOptions {
+                work_done_progress: None,
+            },
+        }),
         text_document_sync: Some(lsp_types::TextDocumentSyncCapability::Options(
             lsp_types::TextDocumentSyncOptions {
                 open_close: None,
                 change: Some(lsp_types::TextDocumentSyncKind::FULL),
-                will_save: None,
-                will_save_wait_until: None,
+                will_save: Some(true),
+                will_save_wait_until: Some(true),
                 save: Some(lsp_types::TextDocumentSyncSaveOptions::SaveOptions(
                     lsp_types::SaveOptions {
                         include_text: Some(false),
