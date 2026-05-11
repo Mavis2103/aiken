@@ -4,6 +4,11 @@
 
 ### Added
 
+- **aiken-lsp**: Call hierarchy support with incoming and outgoing calls.
+- **aiken-lsp**: Hierarchical document symbols for validators and their handlers.
+- **aiken-lsp**: Keyword and snippet completions for various contexts.
+- **aiken-lsp**: Verified code actions with `is_preferred` functionality.
+- **aiken-lsp**: Updated imports for `lsp-types` 0.94.1 compatibility.
 - **aiken-lsp**: Background (non-blocking) compilation — the LSP now spawns a separate thread for each compile cycle, so the editor stays responsive while the project is being type-checked.
 - **aiken-lsp**: Dependency caching (`LspDepCache`) — type information and checked modules for dependency packages are stored and reused across compile cycles, avoiding redundant re-inference when only project sources change.
 - **aiken-lsp**: Per-module incremental cache — unchanged own modules (detected via content hash) are skipped during type-checking, significantly reducing re-compilation time on every keystroke.
