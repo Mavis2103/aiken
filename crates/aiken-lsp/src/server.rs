@@ -30,7 +30,7 @@ use indoc::formatdoc;
 use lsp_server::Connection;
 use lsp_types::{
     DocumentFormattingParams, DocumentSymbol, InitializeParams, SemanticToken, SemanticTokens,
-    SemanticTokensResult, SymbolKind, TextEdit,
+    SemanticTokensRangeResult, SemanticTokensResult, SymbolKind, TextEdit,
     notification::{
         DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument, DidSaveTextDocument,
         Notification, Progress, PublishDiagnostics, ShowMessage,
@@ -38,12 +38,13 @@ use lsp_types::{
     request::{
         CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
         CodeActionRequest, CodeActionResolveRequest, CodeLensRequest, CodeLensResolve, Completion,
-        DocumentHighlightRequest, DocumentLinkRequest, DocumentSymbolRequest, FoldingRangeRequest,
-        Formatting, GotoDefinition, GotoImplementation, GotoTypeDefinition, HoverRequest,
-        InlayHintRequest, LinkedEditingRange, OnTypeFormatting, PrepareRenameRequest,
-        RangeFormatting, References, Rename, Request, SelectionRangeRequest,
-        SemanticTokensFullRequest, SignatureHelpRequest, WillSaveWaitUntil, WorkDoneProgressCreate,
-        WorkspaceSymbolRequest,
+        DocumentColor, DocumentHighlightRequest, DocumentLinkRequest, DocumentSymbolRequest,
+        FoldingRangeRequest, Formatting, GotoDefinition, GotoImplementation, GotoTypeDefinition,
+        HoverRequest, InlayHintRequest, LinkedEditingRange, OnTypeFormatting,
+        PrepareRenameRequest, RangeFormatting, References, Rename, Request,
+        ResolveCompletionItem, SelectionRangeRequest, SemanticTokensFullRequest,
+        SemanticTokensRangeRequest, SignatureHelpRequest, WillSaveWaitUntil,
+        WorkDoneProgressCreate, WorkspaceSymbolRequest,
     },
 };
 use miette::Diagnostic;
@@ -641,6 +642,15 @@ impl Server {
                 })
             }
 
+            ResolveCompletionItem::METHOD => {
+                let item = cast_request::<ResolveCompletionItem>(request)?;
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(item)?),
+                })
+            }
+
             WorkspaceSymbolRequest::METHOD => {
                 let params = cast_request::<WorkspaceSymbolRequest>(request)?;
 
@@ -683,6 +693,36 @@ impl Server {
                             })
                             .collect();
                         SemanticTokensResult::Tokens(SemanticTokens {
+                            result_id: None,
+                            data: tokens,
+                        })
+                    });
+
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
+            SemanticTokensRangeRequest::METHOD => {
+                let params = cast_request::<SemanticTokensRangeRequest>(request)?;
+
+                let result: Option<SemanticTokensRangeResult> = self
+                    .module_for_uri(&params.text_document.uri)
+                    .map(|module| {
+                        let raw = semantic_tokens::semantic_tokens_full(module);
+                        let tokens: Vec<SemanticToken> = raw
+                            .chunks_exact(5)
+                            .map(|c| SemanticToken {
+                                delta_line: c[0],
+                                delta_start: c[1],
+                                length: c[2],
+                                token_type: c[3],
+                                token_modifiers_bitset: c[4],
+                            })
+                            .collect();
+                        SemanticTokensRangeResult::Tokens(SemanticTokens {
                             result_id: None,
                             data: tokens,
                         })
@@ -837,9 +877,27 @@ impl Server {
                 })
             }
 
-            unsupported => Err(ServerError::UnsupportedLspRequest {
-                request: unsupported.to_string(),
-            }),
+            DocumentColor::METHOD => {
+                let _params = cast_request::<DocumentColor>(request)?;
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::Value::Array(Vec::new())),
+                })
+            }
+
+            unsupported => {
+                tracing::warn!("Unsupported LSP request: {unsupported}");
+                Ok(lsp_server::Response {
+                    id,
+                    error: Some(lsp_server::ResponseError {
+                        code: lsp_server::ErrorCode::MethodNotFound as i32,
+                        message: format!("Unsupported method: {unsupported}"),
+                        data: None,
+                    }),
+                    result: None,
+                })
+            }
         }
     }
 
