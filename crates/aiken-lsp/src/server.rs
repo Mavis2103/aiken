@@ -1174,14 +1174,12 @@ impl Server {
     ) {
         use aiken_lang::expr::TypedExpr;
 
-        if let TypedExpr::Var { name, location, .. } = expr {
-            if name == &target.name {
-                let range = span_to_lsp_range(*location, line_numbers);
-                highlights.push(lsp_types::DocumentHighlight {
-                    range,
-                    kind: Some(lsp_types::DocumentHighlightKind::READ),
-                });
-            }
+        if let TypedExpr::Var { name, location, .. } = expr && name == &target.name {
+            let range = span_to_lsp_range(*location, line_numbers);
+            highlights.push(lsp_types::DocumentHighlight {
+                range,
+                kind: Some(lsp_types::DocumentHighlightKind::READ),
+            });
         }
 
         match expr {
@@ -1328,6 +1326,7 @@ impl Server {
     }
 
     /// Look up type definition location from TypeInfo
+    #[allow(clippy::result_large_err)]
     fn find_type_definition(
         &self,
         params: lsp_types::TextDocumentPositionParams,
@@ -1452,18 +1451,17 @@ impl Server {
                     .compiler
                     .as_ref()
                     .and_then(|c| c.sources.get(&module_name))
-                {
-                    if let Ok(uri) = url::Url::from_file_path(
+                    && let Ok(uri) = url::Url::from_file_path(
                         std::path::Path::new(&source.path),
-                    ) {
-                        let range = span_to_lsp_range(use_stmt.location, &line_numbers);
-                        links.push(lsp_types::DocumentLink {
-                            range,
-                            target: Some(uri),
-                            tooltip: Some(module_name),
-                            data: None,
-                        });
-                    }
+                    )
+                {
+                    let range = span_to_lsp_range(use_stmt.location, &line_numbers);
+                    links.push(lsp_types::DocumentLink {
+                        range,
+                        target: Some(uri),
+                        tooltip: Some(module_name),
+                        data: None,
+                    });
                 }
             }
         }

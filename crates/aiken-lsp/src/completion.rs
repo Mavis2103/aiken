@@ -643,7 +643,7 @@ fn validator_handler_keywords() -> Vec<CompletionItem> {
 
 /// Check if the current module has any validator definition
 fn in_validator_context(module: Option<&CheckedModule>) -> bool {
-    module.map_or(false, |m| {
+    module.is_some_and(|m| {
         m.ast
             .definitions()
             .any(|def| matches!(def, Definition::Validator(_)))
