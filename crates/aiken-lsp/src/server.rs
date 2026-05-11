@@ -4,48 +4,80 @@ use crate::{
     error::Error as ServerError,
     quickfix,
     quickfix::Quickfix,
+    semantic_tokens, signature_help,
     utils::{
         COMPILING_PROGRESS_TOKEN, CREATE_COMPILING_PROGRESS_TOKEN, path_to_uri, span_to_lsp_range,
         text_edit_replace, uri_to_module_name,
     },
 };
 use aiken_lang::{
-    ast::{Definition, Located, ModuleKind, Span, Use},
+    ast::{Definition, Located, ModuleKind, Span, TypedDefinition},
     error::ExtraData,
     line_numbers::LineNumbers,
     parser,
-    tipo::pretty::Printer,
+    tipo::{
+        ModuleValueConstructor, ValueConstructorVariant,
+        pretty::Printer, Type,
+    },
 };
 use aiken_project::{
     config::{self, ProjectConfig},
-    error::{Error as ProjectError, GetSource},
+    error::GetSource,
     module::CheckedModule,
 };
 use indoc::formatdoc;
-use itertools::Itertools;
-use lsp_server::{Connection, Message};
+
+use lsp_server::Connection;
 use lsp_types::{
-    DocumentFormattingParams, InitializeParams, TextEdit,
+    DocumentFormattingParams, DocumentSymbol, InitializeParams, SemanticToken, SemanticTokens,
+    SemanticTokensResult, SymbolKind, TextEdit,
     notification::{
         DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument, DidSaveTextDocument,
         Notification, Progress, PublishDiagnostics, ShowMessage,
     },
     request::{
-        CodeActionRequest, Completion, Formatting, GotoDefinition, HoverRequest, Request,
-        WorkDoneProgressCreate,
+        CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
+        CodeActionRequest, CodeActionResolveRequest, CodeLensRequest, CodeLensResolve, Completion,
+        DocumentHighlightRequest, DocumentLinkRequest, DocumentSymbolRequest, FoldingRangeRequest,
+        Formatting, GotoDefinition, GotoImplementation, GotoTypeDefinition, HoverRequest,
+        InlayHintRequest, LinkedEditingRange, OnTypeFormatting, PrepareRenameRequest,
+        RangeFormatting, References, Rename, Request, SelectionRangeRequest,
+        SemanticTokensFullRequest, SignatureHelpRequest, WillSaveWaitUntil, WorkDoneProgressCreate,
+        WorkspaceSymbolRequest,
     },
 };
 use miette::Diagnostic;
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
+pub mod inlay_hints;
 pub mod lsp_project;
 pub mod telemetry;
+pub mod workspace_symbol;
 
-#[allow(dead_code)]
+/// Result returned from background compilation thread
+struct BackgroundCompileResult {
+    compiler: LspProject,
+    stored_diagnostics: HashMap<PathBuf, Vec<lsp_types::Diagnostic>>,
+    stored_messages: Vec<lsp_types::ShowMessageParams>,
+}
+
+unsafe impl Send for BackgroundCompileResult {}
+
+/// Target symbol info for reference searching — enables scope-aware matching
+pub(crate) struct SymbolTarget {
+    pub(crate) name: String,
+    /// The module where this symbol is defined (None = local variable / unknown)
+    pub(crate) def_module: Option<String>,
+    /// Byte span of the definition site — used for precise disambiguation
+    pub(crate) def_span: Span,
+    /// Module where lookup started — needed to disambiguate local variables
+    pub(crate) origin_module: String,
+}
+
 pub struct Server {
     // Project root directory
     root: PathBuf,
@@ -70,7 +102,113 @@ pub struct Server {
     stored_messages: Vec<lsp_types::ShowMessageParams>,
 
     /// An instance of a LspProject
-    compiler: Option<LspProject>,
+    pub(crate) compiler: Option<LspProject>,
+
+    pending_compile: Option<std::thread::JoinHandle<BackgroundCompileResult>>,
+
+    /// Files changed since last successful compilation (used to avoid no-op compiles)
+    files_changed_since_compile: HashSet<String>,
+
+    /// Timestamp of last DidChange notification for debouncing live diagnostics
+    last_change: Option<std::time::Instant>,
+}
+
+fn process_diagnostic_into<E>(
+    error: E,
+    stored_diagnostics: &mut HashMap<PathBuf, Vec<lsp_types::Diagnostic>>,
+    stored_messages: &mut Vec<lsp_types::ShowMessageParams>,
+) where
+    E: miette::Diagnostic + GetSource + ExtraData,
+{
+    let (severity, typ) = match error.severity() {
+        Some(severity) => match severity {
+            miette::Severity::Error => (
+                lsp_types::DiagnosticSeverity::ERROR,
+                lsp_types::MessageType::ERROR,
+            ),
+            miette::Severity::Warning => (
+                lsp_types::DiagnosticSeverity::WARNING,
+                lsp_types::MessageType::WARNING,
+            ),
+            miette::Severity::Advice => (
+                lsp_types::DiagnosticSeverity::HINT,
+                lsp_types::MessageType::INFO,
+            ),
+        },
+        None => (
+            lsp_types::DiagnosticSeverity::ERROR,
+            lsp_types::MessageType::ERROR,
+        ),
+    };
+
+    let message = match error.source() {
+        Some(err) => err.to_string(),
+        None => error.to_string(),
+    };
+
+    if let (Some(path), Some(src)) = (error.path(), error.src()) {
+        let line_numbers = LineNumbers::new(&src);
+
+        let related_labels = || {
+            error
+                .related()
+                .and_then(|mut iter| iter.find(|diag| diag.labels().is_some()))
+                .and_then(|diag| diag.labels())
+        };
+
+        let lsp_range = if let Some(span) = error
+            .labels()
+            .or_else(related_labels)
+            .and_then(|mut labels| labels.next())
+        {
+            span_to_lsp_range(
+                Span {
+                    start: span.inner().offset(),
+                    end: span.inner().offset() + span.inner().len(),
+                },
+                &line_numbers,
+            )
+        } else {
+            stored_messages.push(lsp_types::ShowMessageParams { typ, message });
+            return;
+        };
+
+        let lsp_diagnostic = lsp_types::Diagnostic {
+            range: lsp_range,
+            severity: Some(severity),
+            code: error.clean_code().map(lsp_types::NumberOrString::String),
+            code_description: None,
+            source: None,
+            message,
+            related_information: None,
+            tags: None,
+            data: error.extra_data().map(serde_json::Value::String),
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        let path = path.canonicalize().ok().unwrap_or(path);
+
+        stored_diagnostics
+            .entry(path.clone())
+            .or_default()
+            .push(lsp_diagnostic.clone());
+
+        let lsp_message = if let Some(hint) = error.help() {
+            hint.to_string()
+        } else {
+            "something is off".to_string()
+        };
+
+        let lsp_hint = lsp_types::Diagnostic {
+            severity: Some(lsp_types::DiagnosticSeverity::HINT),
+            message: lsp_message,
+            ..lsp_diagnostic
+        };
+
+        stored_diagnostics.entry(path).or_default().push(lsp_hint);
+    } else {
+        stored_messages.push(lsp_types::ShowMessageParams { typ, message })
+    }
 }
 
 impl Server {
@@ -99,7 +237,7 @@ impl Server {
 
     /// Compile the project if we are in one. Otherwise do nothing.
     #[allow(clippy::result_large_err)]
-    fn compile(&mut self, connection: &Connection) -> Result<(), ServerError> {
+    pub fn compile(&mut self, connection: &Connection) -> Result<(), ServerError> {
         self.notify_client_of_compilation_start(connection)?;
 
         if let Some(compiler) = self.compiler.as_mut() {
@@ -118,6 +256,83 @@ impl Server {
 
         self.notify_client_of_compilation_end(connection)?;
 
+        Ok(())
+    }
+
+    fn spawn_compile(&mut self) {
+        if self.files_changed_since_compile.is_empty()
+            && let Some(compiler) = &self.compiler
+            && !compiler.dep_cache().type_infos.is_empty()
+        {
+            return;
+        }
+
+        let _ = self.pending_compile.take();
+        if let Some(config) = self.config.clone() {
+            let root = self.root.clone();
+            let edited = self.edited.clone();
+            let dep_cache = self
+                .compiler
+                .as_ref()
+                .map(|c| c.dep_cache().clone())
+                .unwrap_or_default();
+            let handle = std::thread::spawn(move || {
+                // Apply unsaved edits before compiling so diagnostics match
+                // the in-editor content. Files are restored after compile.
+                let _guard = EditedFileGuard::new(&edited);
+
+                let mut compiler =
+                    LspProject::new_with_cache(config, root, telemetry::Lsp, dep_cache);
+                let result = compiler.compile();
+                let mut stored_diagnostics: HashMap<PathBuf, Vec<lsp_types::Diagnostic>> =
+                    HashMap::new();
+                let mut stored_messages: Vec<lsp_types::ShowMessageParams> = Vec::new();
+                for warning in compiler.project.warnings() {
+                    process_diagnostic_into(warning, &mut stored_diagnostics, &mut stored_messages);
+                }
+                if let Err(errs) = result {
+                    for err in errs {
+                        process_diagnostic_into(err, &mut stored_diagnostics, &mut stored_messages);
+                    }
+                }
+                BackgroundCompileResult {
+                    compiler,
+                    stored_diagnostics,
+                    stored_messages,
+                }
+            });
+            self.pending_compile = Some(handle);
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn poll_compile_result(&mut self, connection: &Connection) -> Result<(), ServerError> {
+        let finished = self
+            .pending_compile
+            .as_ref()
+            .map(|h| h.is_finished())
+            .unwrap_or(false);
+        if finished && let Some(handle) = self.pending_compile.take() {
+            match handle.join() {
+                Ok(result) => {
+                    self.compiler = Some(result.compiler);
+                    self.files_changed_since_compile.clear();
+                    self.stored_diagnostics = result.stored_diagnostics;
+                    self.stored_messages = result.stored_messages;
+                    self.notify_client_of_compilation_end(connection)?;
+                }
+                Err(_) => {
+                    tracing::error!("Background compilation thread panicked");
+                    // Keep files_changed_since_compile so next save retries
+                    self.stored_messages.push(lsp_types::ShowMessageParams {
+                        typ: lsp_types::MessageType::ERROR,
+                        message: "Background compilation crashed — please save again to retry"
+                            .to_string(),
+                    });
+                }
+            }
+            self.publish_stored_diagnostics(connection)?;
+        }
         Ok(())
     }
 
@@ -151,47 +366,28 @@ impl Server {
         }
     }
 
+    fn format_src(&self, path: &str) -> String {
+        let src = match self.edited.get(path) {
+            Some(src) => src.clone(),
+            None => fs::read_to_string(path).unwrap_or_default(),
+        };
+
+        if let Ok((module, extra)) = parser::module(&src, ModuleKind::Lib) {
+            let mut new_text = String::new();
+            aiken_lang::format::pretty(&mut new_text, module, extra, &src);
+            new_text
+        } else {
+            src
+        }
+    }
+
     fn format(
         &mut self,
         params: DocumentFormattingParams,
-    ) -> Result<Vec<TextEdit>, Vec<ProjectError>> {
+    ) -> Vec<TextEdit> {
         let path = params.text_document.uri.path();
-        let mut new_text = String::new();
-
-        match self.edited.get(path) {
-            Some(src) => {
-                let (module, extra) = parser::module(src, ModuleKind::Lib).map_err(|errs| {
-                    aiken_project::error::Error::from_parse_errors(errs, Path::new(path), src)
-                })?;
-
-                aiken_lang::format::pretty(&mut new_text, module, extra, src);
-            }
-            None => {
-                let src = {
-                    #[cfg(not(target_os = "windows"))]
-                    {
-                        fs::read_to_string(path).map_err(ProjectError::from)?
-                    }
-                    #[cfg(target_os = "windows")]
-                    {
-                        let temp = match urlencoding::decode(path) {
-                            Ok(decoded) => decoded.to_string(),
-                            Err(_) => path.to_owned(),
-                        };
-                        fs::read_to_string(temp.trim_start_matches("/"))
-                            .map_err(ProjectError::from)?
-                    }
-                };
-
-                let (module, extra) = parser::module(&src, ModuleKind::Lib).map_err(|errs| {
-                    aiken_project::error::Error::from_parse_errors(errs, Path::new(path), &src)
-                })?;
-
-                aiken_lang::format::pretty(&mut new_text, module, extra, &src);
-            }
-        }
-
-        Ok(vec![text_edit_replace(new_text)])
+        let new_text = self.format_src(path);
+        vec![text_edit_replace(new_text)]
     }
 
     #[allow(clippy::result_large_err)]
@@ -203,50 +399,46 @@ impl Server {
         match notification.method.as_str() {
             DidSaveTextDocument::METHOD => {
                 let params = cast_notification::<DidSaveTextDocument>(notification)?;
-
-                self.edited.remove(params.text_document.uri.path());
-
-                self.compile(connection)?;
-
-                self.publish_stored_diagnostics(connection)?;
-
+                let file_path = params.text_document.uri.path();
+                self.edited.remove(file_path);
+                self.files_changed_since_compile
+                    .insert(file_path.to_string());
+                self.notify_client_of_compilation_start(connection)?;
+                self.spawn_compile();
                 Ok(())
             }
 
             DidChangeTextDocument::METHOD => {
                 let params = cast_notification::<DidChangeTextDocument>(notification)?;
-
-                // A file has changed in the editor so store a copy of the new content in memory
                 let path = params.text_document.uri.path().to_string();
-
                 if let Some(changes) = params.content_changes.into_iter().next() {
-                    self.edited.insert(path, changes.text);
+                    self.edited.insert(path.clone(), changes.text);
+                    self.files_changed_since_compile.insert(path);
+                    self.last_change = Some(std::time::Instant::now());
                 }
-
                 Ok(())
             }
 
             DidCloseTextDocument::METHOD => {
                 let params = cast_notification::<DidCloseTextDocument>(notification)?;
-
-                self.edited.remove(params.text_document.uri.path());
-
+                let file_path = params.text_document.uri.path();
+                self.edited.remove(file_path);
                 Ok(())
             }
 
             DidChangeWatchedFiles::METHOD => {
                 if let Ok(config) = ProjectConfig::load(&self.root) {
                     self.config = Some(config);
-                    self.create_new_compiler();
-                    self.compile(connection)?;
+                    self.files_changed_since_compile
+                        .insert("__config__".to_string());
+                    self.notify_client_of_compilation_start(connection)?;
+                    self.spawn_compile();
                 } else {
                     self.stored_messages.push(lsp_types::ShowMessageParams {
                         typ: lsp_types::MessageType::ERROR,
                         message: "Failed to reload aiken.toml".to_string(),
                     });
                 }
-
-                self.publish_stored_diagnostics(connection)?;
 
                 Ok(())
             }
@@ -259,7 +451,7 @@ impl Server {
     fn handle_request(
         &mut self,
         request: lsp_server::Request,
-        connection: &Connection,
+        _connection: &Connection,
     ) -> Result<lsp_server::Response, ServerError> {
         let id = request.id.clone();
 
@@ -267,32 +459,29 @@ impl Server {
             Formatting::METHOD => {
                 let params = cast_request::<Formatting>(request)?;
 
-                let result = self.format(params);
+                let text_edit = self.format(params);
+                let result = serde_json::to_value(text_edit)?;
 
-                match result {
-                    Ok(text_edit) => {
-                        let result = serde_json::to_value(text_edit)?;
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(result),
+                })
+            }
 
-                        Ok(lsp_server::Response {
-                            id,
-                            error: None,
-                            result: Some(result),
-                        })
-                    }
-                    Err(errors) => {
-                        for error in errors {
-                            self.process_diagnostic(error)?;
-                        }
+            WillSaveWaitUntil::METHOD => {
+                let params = cast_request::<WillSaveWaitUntil>(request)?;
 
-                        self.publish_stored_diagnostics(connection)?;
+                // Format the document before save so the saved file is clean
+                let path = params.text_document.uri.path();
+                let new_text = self.format_src(path);
+                let edits = vec![text_edit_replace(new_text)];
 
-                        Ok(lsp_server::Response {
-                            id,
-                            error: None,
-                            result: Some(serde_json::json!(null)),
-                        })
-                    }
-                }
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(Some(edits))?),
+                })
             }
 
             HoverRequest::METHOD => {
@@ -319,18 +508,6 @@ impl Server {
                 })
             }
 
-            Completion::METHOD => {
-                let params = cast_request::<Completion>(request).expect("cast Completion");
-
-                let completions = self.completion(params);
-
-                Ok(lsp_server::Response {
-                    id,
-                    error: None,
-                    result: Some(serde_json::to_value(completions)?),
-                })
-            }
-
             CodeActionRequest::METHOD => {
                 let mut actions = Vec::new();
 
@@ -347,8 +524,12 @@ impl Server {
                                 unused_imports.extend(diagnostics);
                             }
                             Some(strategy) => {
-                                let quickfixes =
-                                    quickfix::quickfix(compiler, &params.text_document, &strategy);
+                                let quickfixes = quickfix::quickfix(
+                                    compiler,
+                                    &params.text_document,
+                                    &strategy,
+                                    &self.edited,
+                                );
                                 actions.extend(quickfixes);
                             }
                         }
@@ -364,6 +545,7 @@ impl Server {
                             compiler,
                             &params.text_document,
                             &Quickfix::UnusedImports(unused_imports),
+                            &self.edited,
                         );
                         actions.extend(quickfixes);
                     }
@@ -376,67 +558,1326 @@ impl Server {
                 })
             }
 
+            CodeActionResolveRequest::METHOD => {
+                let action = cast_request::<CodeActionResolveRequest>(request)
+                    .expect("cast code action resolve request");
+
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(action)?),
+                })
+            }
+
+            DocumentSymbolRequest::METHOD => {
+                let params = cast_request::<DocumentSymbolRequest>(request)?;
+
+                let symbols = self.document_symbols(params)?;
+
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(symbols)?),
+                })
+            }
+
+            References::METHOD => {
+                let params = cast_request::<References>(request)?;
+
+                let references = self.references(params)?;
+
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(references)?),
+                })
+            }
+
+            PrepareRenameRequest::METHOD => {
+                let params = cast_request::<PrepareRenameRequest>(request)?;
+
+                let result = self.prepare_rename(params);
+
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
+            Rename::METHOD => {
+                let params = cast_request::<Rename>(request)?;
+
+                let result = self.rename(params);
+
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
+            InlayHintRequest::METHOD => {
+                let params = cast_request::<InlayHintRequest>(request)?;
+
+                let hints = self.inlay_hints(params);
+
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(hints)?),
+                })
+            }
+
+            Completion::METHOD => {
+                let params = cast_request::<Completion>(request)?;
+
+                let result = self.completion(params);
+
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
+            WorkspaceSymbolRequest::METHOD => {
+                let params = cast_request::<WorkspaceSymbolRequest>(request)?;
+
+                let result = self.workspace_symbol(params.query);
+
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
+            SignatureHelpRequest::METHOD => {
+                let params = cast_request::<SignatureHelpRequest>(request)?;
+
+                let result = signature_help::signature_help(self, params);
+
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
+            SemanticTokensFullRequest::METHOD => {
+                let params = cast_request::<SemanticTokensFullRequest>(request)?;
+
+                let result = self
+                    .module_for_uri(&params.text_document.uri)
+                    .map(|module| {
+                        let raw = semantic_tokens::semantic_tokens_full(module);
+                        let tokens: Vec<SemanticToken> = raw
+                            .chunks_exact(5)
+                            .map(|c| SemanticToken {
+                                delta_line: c[0],
+                                delta_start: c[1],
+                                length: c[2],
+                                token_type: c[3],
+                                token_modifiers_bitset: c[4],
+                            })
+                            .collect();
+                        SemanticTokensResult::Tokens(SemanticTokens {
+                            result_id: None,
+                            data: tokens,
+                        })
+                    });
+
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
+            SelectionRangeRequest::METHOD => {
+                let params = cast_request::<SelectionRangeRequest>(request)?;
+
+                let result = self.selection_range(params)?;
+
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
+            RangeFormatting::METHOD => {
+                let params = cast_request::<RangeFormatting>(request)?;
+                let result = self.range_format(params)?;
+                let value = match result {
+                    Some(edits) => serde_json::to_value(Some(edits))?,
+                    None => serde_json::json!(null),
+                };
+                Ok(lsp_server::Response { id, error: None, result: Some(value) })
+            }
+
+            OnTypeFormatting::METHOD => {
+                let params = cast_request::<OnTypeFormatting>(request)?;
+                let result = self.on_type_format(params)?;
+                let value = match result {
+                    Some(edits) => serde_json::to_value(Some(edits))?,
+                    None => serde_json::json!(null),
+                };
+                Ok(lsp_server::Response { id, error: None, result: Some(value) })
+            }
+
+            FoldingRangeRequest::METHOD => {
+                let params = cast_request::<FoldingRangeRequest>(request)?;
+                let result = self.folding_range(params)?;
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
+            DocumentHighlightRequest::METHOD => {
+                let params = cast_request::<DocumentHighlightRequest>(request)?;
+                let result = self.document_highlight(params)?;
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
+            LinkedEditingRange::METHOD => {
+                let params = cast_request::<LinkedEditingRange>(request)?;
+                let result = self.linked_editing_ranges(params)?;
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
+            GotoTypeDefinition::METHOD => {
+                let params = cast_request::<GotoTypeDefinition>(request)?;
+                let result = self.goto_type_definition(params)?;
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
+            GotoImplementation::METHOD => {
+                let params = cast_request::<GotoImplementation>(request)?;
+                let result = self.goto_implementation(params)?;
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
+            DocumentLinkRequest::METHOD => {
+                let params = cast_request::<DocumentLinkRequest>(request)?;
+                let result = self.document_link(params)?;
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
+            CodeLensRequest::METHOD => {
+                let params = cast_request::<CodeLensRequest>(request)?;
+                let result = self.code_lens(params)?;
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
+            CodeLensResolve::METHOD => {
+                let lens = cast_request::<CodeLensResolve>(request)
+                    .expect("cast code lens resolve");
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(lens)?),
+                })
+            }
+
+            CallHierarchyPrepare::METHOD => {
+                let params = cast_request::<CallHierarchyPrepare>(request)?;
+                let result = self.call_hierarchy_prepare(params)?;
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
+            CallHierarchyIncomingCalls::METHOD => {
+                let params = cast_request::<CallHierarchyIncomingCalls>(request)?;
+                let result = self.call_hierarchy_incoming(params)?;
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
+            CallHierarchyOutgoingCalls::METHOD => {
+                let params = cast_request::<CallHierarchyOutgoingCalls>(request)?;
+                let result = self.call_hierarchy_outgoing(params)?;
+                Ok(lsp_server::Response {
+                    id,
+                    error: None,
+                    result: Some(serde_json::to_value(result)?),
+                })
+            }
+
             unsupported => Err(ServerError::UnsupportedLspRequest {
                 request: unsupported.to_string(),
             }),
         }
     }
 
-    fn completion(
-        &self,
-        params: lsp_types::CompletionParams,
-    ) -> Option<Vec<lsp_types::CompletionItem>> {
-        let found = self
-            .node_at_position(&params.text_document_position)
-            .map(|(_, found)| found);
+    /// Range formatting
+    #[allow(clippy::result_large_err)]
+    fn range_format(
+        &mut self,
+        params: lsp_types::DocumentRangeFormattingParams,
+    ) -> Result<Option<Vec<lsp_types::TextEdit>>, ServerError> {
+        let path = params.text_document.uri.path();
+        let src = match self.edited.get(path) {
+            Some(src) => src.clone(),
+            None => match fs::read_to_string(path) {
+                Ok(src) => src,
+                Err(_) => return Ok(None),
+            },
+        };
 
-        match found {
-            // TODO: test
-            None => self.completion_for_import(&[]),
-            Some(Located::Definition(Definition::Use(Use { module, .. }))) => {
-                self.completion_for_import(module)
-            }
+        let (module, extra) = match parser::module(&src, ModuleKind::Lib) {
+            Ok(result) => result,
+            Err(_) => return Ok(None),
+        };
 
-            // TODO: autocompletion for patterns
-            Some(Located::Pattern(_pattern, _value)) => None,
+        let mut new_text = String::new();
+        aiken_lang::format::pretty(&mut new_text, module, extra, &src);
 
-            // TODO: autocompletion for other definitions
-            Some(Located::Definition(_expression)) => None,
+        let line_numbers = LineNumbers::new(&src);
+        let start_byte = line_numbers.byte_index(
+            params.range.start.line as usize,
+            params.range.start.character as usize,
+        );
+        let end_byte = line_numbers.byte_index(
+            params.range.end.line as usize,
+            params.range.end.character as usize,
+        );
+        let old_range_text = &src[start_byte..end_byte.min(src.len())];
 
-            // TODO: autocompletion for expressions
-            Some(Located::Expression(_expression)) => None,
+        let new_line_numbers = LineNumbers::new(&new_text);
+        let new_start_byte = new_line_numbers.byte_index(
+            params.range.start.line as usize,
+            params.range.start.character as usize,
+        );
+        let new_end_byte = new_line_numbers.byte_index(
+            params.range.end.line as usize,
+            params.range.end.character as usize,
+        );
+        let new_range_text = &new_text[new_start_byte..new_end_byte.min(new_text.len())];
 
-            // TODO: autocompletion for arguments?
-            Some(Located::Argument(_arg_name, _tipo)) => None,
-
-            // TODO: autocompletion for annotation?
-            Some(Located::Annotation(_annotation)) => None,
+        if old_range_text != new_range_text {
+            let edit = lsp_types::TextEdit {
+                range: params.range,
+                new_text: new_range_text.to_string(),
+            };
+            Ok(Some(vec![edit]))
+        } else {
+            Ok(Some(vec![]))
         }
     }
 
-    fn completion_for_import(&self, module: &[String]) -> Option<Vec<lsp_types::CompletionItem>> {
-        let compiler = self.compiler.as_ref()?;
+    /// Format on type
+    #[allow(clippy::result_large_err)]
+    fn on_type_format(
+        &mut self,
+        params: lsp_types::DocumentOnTypeFormattingParams,
+    ) -> Result<Option<Vec<lsp_types::TextEdit>>, ServerError> {
+        let path = params.text_document_position.text_document.uri.path();
+        let src = match self.edited.get(path) {
+            Some(src) => src.clone(),
+            None => match fs::read_to_string(path) {
+                Ok(src) => src,
+                Err(_) => return Ok(None),
+            },
+        };
 
-        // TODO: Test
-        let dependencies_modules = compiler.project.importable_modules();
+        let (module, extra) = match parser::module(&src, ModuleKind::Lib) {
+            Ok(result) => result,
+            Err(_) => return Ok(None),
+        };
 
-        // TODO: Test
-        let project_modules = compiler.modules.keys().cloned();
+        let mut new_text = String::new();
+        aiken_lang::format::pretty(&mut new_text, module, extra, &src);
 
-        let modules = dependencies_modules
-            .into_iter()
-            .chain(project_modules)
-            .sorted()
-            .filter(|m| m.starts_with(&module.join("/")))
-            .map(|label| lsp_types::CompletionItem {
-                label,
+        let line_numbers = LineNumbers::new(&src);
+        let line = params.text_document_position.position.line as usize;
+
+        let line_start = line_numbers.byte_index(line, 0);
+        let line_end = if line + 1 >= line_numbers.line_number(src.len()).unwrap_or(0) {
+            src.len()
+        } else {
+            line_numbers.byte_index(line + 1, 0)
+        };
+
+        let new_line_numbers = LineNumbers::new(&new_text);
+        let new_line_start = new_line_numbers.byte_index(line, 0);
+        let new_line_end = if line + 1 >= new_line_numbers.line_number(new_text.len()).unwrap_or(0)
+        {
+            new_text.len()
+        } else {
+            new_line_numbers.byte_index(line + 1, 0)
+        };
+
+        let old_line = &src[line_start..line_end.min(src.len())];
+        let new_line = &new_text[new_line_start..new_line_end.min(new_text.len())];
+
+        if old_line != new_line {
+            let range = lsp_types::Range {
+                start: lsp_types::Position {
+                    line: line as u32,
+                    character: 0,
+                },
+                end: lsp_types::Position {
+                    line: line as u32,
+                    character: old_line.len() as u32,
+                },
+            };
+            Ok(Some(vec![lsp_types::TextEdit {
+                range,
+                new_text: new_line.to_string(),
+            }]))
+        } else {
+            Ok(Some(vec![]))
+        }
+    }
+
+    /// Compute folding ranges
+    #[allow(clippy::result_large_err)]
+    fn folding_range(
+        &self,
+        params: lsp_types::FoldingRangeParams,
+    ) -> Result<Option<Vec<lsp_types::FoldingRange>>, ServerError> {
+        let module = match self.module_for_uri(&params.text_document.uri) {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+
+        let line_numbers = LineNumbers::new(&module.code);
+        let mut ranges = Vec::new();
+
+        for def in &module.ast.definitions {
+            if let Some(range) = self.definition_to_folding_range(def, &line_numbers) {
+                ranges.push(range);
+            }
+        }
+
+        if let Some(import_range) =
+            self.import_folding_range(&module.ast.definitions, &line_numbers)
+        {
+            ranges.push(import_range);
+        }
+
+        if ranges.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(ranges))
+        }
+    }
+
+    fn definition_to_folding_range(
+        &self,
+        def: &aiken_lang::ast::TypedDefinition,
+        line_numbers: &LineNumbers,
+    ) -> Option<lsp_types::FoldingRange> {
+        use aiken_lang::ast::Definition;
+
+        let (start_line, end_line) = match def {
+            Definition::Fn(func) => {
+                let start = line_numbers.line_and_column_number(func.location.start)?;
+                let end = line_numbers.line_and_column_number(func.location.end)?;
+                (start.line as u32 - 1, end.line as u32 - 1)
+            }
+            Definition::Validator(validator) => {
+                let start = line_numbers.line_and_column_number(validator.location.start)?;
+                let end = line_numbers.line_and_column_number(validator.location.end)?;
+                (start.line as u32 - 1, end.line as u32 - 1)
+            }
+            Definition::DataType(dt) => {
+                let start = line_numbers.line_and_column_number(dt.location.start)?;
+                let end = line_numbers.line_and_column_number(dt.location.end)?;
+                (start.line as u32 - 1, end.line as u32 - 1)
+            }
+            Definition::TypeAlias(ta) => {
+                let start = line_numbers.line_and_column_number(ta.location.start)?;
+                let end = line_numbers.line_and_column_number(ta.location.end)?;
+                (start.line as u32 - 1, end.line as u32 - 1)
+            }
+            Definition::ModuleConstant(c) => {
+                let start = line_numbers.line_and_column_number(c.location.start)?;
+                let end = line_numbers.line_and_column_number(c.location.end)?;
+                (start.line as u32 - 1, end.line as u32 - 1)
+            }
+            Definition::Test(func) => {
+                let start = line_numbers.line_and_column_number(func.location.start)?;
+                let end = line_numbers.line_and_column_number(func.location.end)?;
+                (start.line as u32 - 1, end.line as u32 - 1)
+            }
+            Definition::Benchmark(func) => {
+                let start = line_numbers.line_and_column_number(func.location.start)?;
+                let end = line_numbers.line_and_column_number(func.location.end)?;
+                (start.line as u32 - 1, end.line as u32 - 1)
+            }
+            Definition::Use(_) => return None,
+        };
+
+        if end_line > start_line {
+            Some(lsp_types::FoldingRange {
+                start_line,
+                start_character: None,
+                end_line,
+                end_character: None,
                 kind: None,
-                documentation: None,
-                ..Default::default()
+                collapsed_text: None,
             })
-            .collect();
+        } else {
+            None
+        }
+    }
 
-        Some(modules)
+    fn import_folding_range(
+        &self,
+        definitions: &[aiken_lang::ast::TypedDefinition],
+        line_numbers: &LineNumbers,
+    ) -> Option<lsp_types::FoldingRange> {
+        use aiken_lang::ast::Definition;
+
+        let mut import_spans = Vec::new();
+        for def in definitions {
+            if let Definition::Use(use_stmt) = def {
+                import_spans.push(use_stmt.location);
+            }
+        }
+
+        if import_spans.len() >= 2 {
+            let first = import_spans.first()?;
+            let last = import_spans.last()?;
+
+            let start = line_numbers.line_and_column_number(first.start)?;
+            let end = line_numbers.line_and_column_number(last.end)?;
+
+            Some(lsp_types::FoldingRange {
+                start_line: start.line as u32 - 1,
+                start_character: None,
+                end_line: end.line as u32 - 1,
+                end_character: None,
+                kind: Some(lsp_types::FoldingRangeKind::Imports),
+                collapsed_text: None,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Document highlight
+    #[allow(clippy::result_large_err)]
+    fn document_highlight(
+        &self,
+        params: lsp_types::DocumentHighlightParams,
+    ) -> Result<Option<Vec<lsp_types::DocumentHighlight>>, ServerError> {
+        let module = match self.module_for_uri(
+            &params.text_document_position_params.text_document.uri,
+        ) {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+
+        let line_numbers = LineNumbers::new(&module.code);
+
+        let target = match self.find_symbol_at_position(
+            &params.text_document_position_params.position,
+            module,
+            &line_numbers,
+        ) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        let mut highlights = Vec::new();
+
+        for def in &module.ast.definitions {
+            self.find_highlights_in_definition(&target, def, &line_numbers, &mut highlights);
+        }
+
+        if highlights.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(highlights))
+        }
+    }
+
+    fn find_highlights_in_definition(
+        &self,
+        target: &SymbolTarget,
+        def: &aiken_lang::ast::TypedDefinition,
+        line_numbers: &LineNumbers,
+        highlights: &mut Vec<lsp_types::DocumentHighlight>,
+    ) {
+        use aiken_lang::ast::Definition;
+
+        match def {
+            Definition::Fn(func) => {
+                self.find_highlights_in_expr(target, &func.body, line_numbers, highlights);
+            }
+            Definition::Validator(validator) => {
+                for handler in &validator.handlers {
+                    self.find_highlights_in_expr(target, &handler.body, line_numbers, highlights);
+                }
+                self.find_highlights_in_expr(
+                    target,
+                    &validator.fallback.body,
+                    line_numbers,
+                    highlights,
+                );
+            }
+            Definition::Test(func) => {
+                self.find_highlights_in_expr(target, &func.body, line_numbers, highlights);
+            }
+            Definition::Benchmark(func) => {
+                self.find_highlights_in_expr(target, &func.body, line_numbers, highlights);
+            }
+            Definition::ModuleConstant(constant) => {
+                self.find_highlights_in_expr(target, &constant.value, line_numbers, highlights);
+            }
+            _ => {}
+        }
+    }
+
+    fn find_highlights_in_expr(
+        &self,
+        target: &SymbolTarget,
+        expr: &aiken_lang::expr::TypedExpr,
+        line_numbers: &LineNumbers,
+        highlights: &mut Vec<lsp_types::DocumentHighlight>,
+    ) {
+        use aiken_lang::expr::TypedExpr;
+
+        if let TypedExpr::Var { name, location, .. } = expr {
+            if name == &target.name {
+                let range = span_to_lsp_range(*location, line_numbers);
+                highlights.push(lsp_types::DocumentHighlight {
+                    range,
+                    kind: Some(lsp_types::DocumentHighlightKind::READ),
+                });
+            }
+        }
+
+        match expr {
+            TypedExpr::Call { fun, args, .. } => {
+                self.find_highlights_in_expr(target, fun, line_numbers, highlights);
+                for arg in args {
+                    self.find_highlights_in_expr(target, &arg.value, line_numbers, highlights);
+                }
+            }
+            TypedExpr::Fn { body, .. } => {
+                self.find_highlights_in_expr(target, body, line_numbers, highlights);
+            }
+            TypedExpr::List {
+                elements, tail, ..
+            } => {
+                for elem in elements {
+                    self.find_highlights_in_expr(target, elem, line_numbers, highlights);
+                }
+                if let Some(t) = tail {
+                    self.find_highlights_in_expr(target, t, line_numbers, highlights);
+                }
+            }
+            TypedExpr::Tuple { elems, .. } => {
+                for elem in elems {
+                    self.find_highlights_in_expr(target, elem, line_numbers, highlights);
+                }
+            }
+            TypedExpr::Pair { fst, snd, .. } => {
+                self.find_highlights_in_expr(target, fst, line_numbers, highlights);
+                self.find_highlights_in_expr(target, snd, line_numbers, highlights);
+            }
+            TypedExpr::RecordAccess { record, .. } => {
+                self.find_highlights_in_expr(target, record, line_numbers, highlights);
+            }
+            TypedExpr::TupleIndex { tuple, .. } => {
+                self.find_highlights_in_expr(target, tuple, line_numbers, highlights);
+            }
+            TypedExpr::RecordUpdate { spread, args, .. } => {
+                self.find_highlights_in_expr(target, spread, line_numbers, highlights);
+                for arg in args {
+                    self.find_highlights_in_expr(target, &arg.value, line_numbers, highlights);
+                }
+            }
+            TypedExpr::UnOp { value, .. } => {
+                self.find_highlights_in_expr(target, value, line_numbers, highlights);
+            }
+            TypedExpr::BinOp { left, right, .. } => {
+                self.find_highlights_in_expr(target, left, line_numbers, highlights);
+                self.find_highlights_in_expr(target, right, line_numbers, highlights);
+            }
+            TypedExpr::If {
+                branches, final_else, ..
+            } => {
+                for branch in branches {
+                    self.find_highlights_in_expr(
+                        target,
+                        &branch.condition,
+                        line_numbers,
+                        highlights,
+                    );
+                    self.find_highlights_in_expr(target, &branch.body, line_numbers, highlights);
+                }
+                self.find_highlights_in_expr(target, final_else, line_numbers, highlights);
+            }
+            TypedExpr::When {
+                subject, clauses, ..
+            } => {
+                self.find_highlights_in_expr(target, subject, line_numbers, highlights);
+                for clause in clauses {
+                    self.find_highlights_in_expr(
+                        target,
+                        &clause.then,
+                        line_numbers,
+                        highlights,
+                    );
+                }
+            }
+            TypedExpr::Sequence { expressions, .. } => {
+                for expr in expressions {
+                    self.find_highlights_in_expr(target, expr, line_numbers, highlights);
+                }
+            }
+            TypedExpr::Assignment { value, .. } => {
+                self.find_highlights_in_expr(target, value, line_numbers, highlights);
+            }
+            TypedExpr::Trace { then, .. } => {
+                self.find_highlights_in_expr(target, then, line_numbers, highlights);
+            }
+            _ => {}
+        }
+    }
+
+    /// Linked editing ranges
+    #[allow(clippy::result_large_err)]
+    fn linked_editing_ranges(
+        &self,
+        _params: lsp_types::LinkedEditingRangeParams,
+    ) -> Result<Option<lsp_types::LinkedEditingRanges>, ServerError> {
+        Ok(None)
+    }
+
+    /// Go to type definition
+    #[allow(clippy::result_large_err)]
+    fn goto_type_definition(
+        &self,
+        params: lsp_types::request::GotoTypeDefinitionParams,
+    ) -> Result<Option<lsp_types::request::GotoTypeDefinitionResponse>, ServerError> {
+        let params = params.text_document_position_params;
+        let (_line_numbers, node) = match self.node_at_position(&params) {
+            Some(location) => location,
+            None => return Ok(None),
+        };
+
+        let expr = match node {
+            aiken_lang::ast::Located::Expression(e) => e,
+            _ => return Ok(None),
+        };
+
+        let (module, name) = match expr.tipo().as_ref() {
+            Type::App { module, name, .. } => (module.clone(), name.clone()),
+            _ => return Ok(None),
+        };
+
+        if Self::is_primitive_type(&module, &name) {
+            return Ok(None);
+        }
+
+        self.find_type_definition(params, &name)
+    }
+
+    /// Check if a type name is a built-in primitive
+    fn is_primitive_type(module: &str, name: &str) -> bool {
+        if module.is_empty() {
+            matches!(
+                name,
+                "Int" | "ByteArray" | "String" | "Bool" | "Data" | "List" | "Pair"
+                    | "Ordering" | "Void" | "Never" | "Option" | "G1Element" | "G2Element"
+                    | "MillerLoopResult" | "PRNG" | "Sampler" | "Fuzzer" | "__ScriptContext"
+                    | "__ScriptPurpose"
+            )
+        } else {
+            false
+        }
+    }
+
+    /// Look up type definition location from TypeInfo
+    fn find_type_definition(
+        &self,
+        params: lsp_types::TextDocumentPositionParams,
+        type_name: &str,
+    ) -> Result<Option<lsp_types::request::GotoTypeDefinitionResponse>, ServerError> {
+        let current_module = match self.module_for_uri(&params.text_document.uri) {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+
+        let type_constructor = match current_module.ast.type_info.types.get(type_name) {
+            Some(tc) => tc,
+            None => return Ok(None),
+        };
+
+        let (uri, line_numbers) = if type_constructor.module.is_empty() {
+            let line_numbers = LineNumbers::new(&current_module.code);
+            (params.text_document.uri, line_numbers)
+        } else {
+            let source = match self
+                .compiler
+                .as_ref()
+                .and_then(|c| c.sources.get(&type_constructor.module))
+            {
+                Some(s) => s,
+                None => return Ok(None),
+            };
+            let uri = match url::Url::from_file_path(std::path::Path::new(&source.path)) {
+                Ok(u) => u,
+                Err(_) => return Ok(None),
+            };
+            let module = match self.module_for_uri(&uri) {
+                Some(m) => m,
+                None => return Ok(None),
+            };
+            let line_numbers = LineNumbers::new(&module.code);
+            (uri, line_numbers)
+        };
+
+        let range = span_to_lsp_range(type_constructor.location, &line_numbers);
+
+        Ok(Some(lsp_types::request::GotoTypeDefinitionResponse::Scalar(
+            lsp_types::Location { uri, range },
+        )))
+    }
+
+    /// Go to implementation
+    #[allow(clippy::result_large_err)]
+    fn goto_implementation(
+        &self,
+        params: lsp_types::request::GotoImplementationParams,
+    ) -> Result<Option<lsp_types::request::GotoImplementationResponse>, ServerError> {
+        // Delegate to references: find all references to the symbol at cursor
+        // GotoImplementationParams is a type alias for GotoDefinitionParams
+        let text_doc_params = params.text_document_position_params;
+        let line_numbers = match self.node_at_position(&text_doc_params) {
+            Some((ln, _)) => ln,
+            None => return Ok(None),
+        };
+
+        let module = match self.module_for_uri(&text_doc_params.text_document.uri) {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+
+        let target = match self.find_symbol_at_position(
+            &text_doc_params.position,
+            module,
+            &line_numbers,
+        ) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        let compiler = match &self.compiler {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        let mut locations = Vec::new();
+
+        for (module_name, checked_module) in &compiler.modules {
+            if let Some(module_refs) =
+                self.find_references_in_module(&target, checked_module, module_name)
+            {
+                locations.extend(module_refs);
+            }
+        }
+
+        if locations.is_empty() {
+            Ok(None)
+        } else if locations.len() == 1 {
+            Ok(Some(lsp_types::request::GotoImplementationResponse::Scalar(
+                locations.into_iter().next().unwrap(),
+            )))
+        } else {
+            Ok(Some(lsp_types::request::GotoImplementationResponse::Array(
+                locations,
+            )            ))
+        }
+    }
+
+    /// Document link provider: creates links from import statements to .ak files
+    #[allow(clippy::result_large_err)]
+    fn document_link(
+        &self,
+        params: lsp_types::DocumentLinkParams,
+    ) -> Result<Option<Vec<lsp_types::DocumentLink>>, ServerError> {
+        let module = match self.module_for_uri(&params.text_document.uri) {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+
+        let line_numbers = LineNumbers::new(&module.code);
+        let mut links = Vec::new();
+
+        for def in &module.ast.definitions {
+            if let aiken_lang::ast::Definition::Use(use_stmt) = def {
+                // Convert the use module path to a file path
+                let module_name = use_stmt.module.join("/");
+                if let Some(source) = self
+                    .compiler
+                    .as_ref()
+                    .and_then(|c| c.sources.get(&module_name))
+                {
+                    if let Ok(uri) = url::Url::from_file_path(
+                        std::path::Path::new(&source.path),
+                    ) {
+                        let range = span_to_lsp_range(use_stmt.location, &line_numbers);
+                        links.push(lsp_types::DocumentLink {
+                            range,
+                            target: Some(uri),
+                            tooltip: Some(module_name),
+                            data: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        if links.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(links))
+        }
+    }
+
+    /// Code lens provider: adds "▶ Run Test" for test/benchmark functions
+    #[allow(clippy::result_large_err)]
+    fn code_lens(
+        &self,
+        params: lsp_types::CodeLensParams,
+    ) -> Result<Option<Vec<lsp_types::CodeLens>>, ServerError> {
+        let module = match self.module_for_uri(&params.text_document.uri) {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+
+        let line_numbers = LineNumbers::new(&module.code);
+        let mut lenses = Vec::new();
+
+        for def in &module.ast.definitions {
+            match def {
+                aiken_lang::ast::Definition::Test(func) => {
+                    let range = span_to_lsp_range(func.location, &line_numbers);
+                    lenses.push(lsp_types::CodeLens {
+                        range,
+                        command: Some(lsp_types::Command {
+                            title: "▶ Run Test".to_string(),
+                            command: "aiken.test.run".to_string(),
+                            arguments: Some(vec![
+                                serde_json::json!(module.name),
+                                serde_json::json!(func.name),
+                            ]),
+                        }),
+                        data: None,
+                    });
+                }
+                aiken_lang::ast::Definition::Benchmark(func) => {
+                    let range = span_to_lsp_range(func.location, &line_numbers);
+                    lenses.push(lsp_types::CodeLens {
+                        range,
+                        command: Some(lsp_types::Command {
+                            title: "▶ Run Benchmark".to_string(),
+                            command: "aiken.benchmark.run".to_string(),
+                            arguments: Some(vec![
+                                serde_json::json!(module.name),
+                                serde_json::json!(func.name),
+                            ]),
+                        }),
+                        data: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        if lenses.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(lenses))
+        }
+    }
+
+    /// Call hierarchy prepare: returns the item at cursor for call hierarchy
+    #[allow(clippy::result_large_err)]
+    fn call_hierarchy_prepare(
+        &self,
+        params: lsp_types::CallHierarchyPrepareParams,
+    ) -> Result<Option<Vec<lsp_types::CallHierarchyItem>>, ServerError> {
+        let params = params.text_document_position_params;
+        let (line_numbers, node) = match self.node_at_position(&params) {
+            Some(location) => location,
+            None => return Ok(None),
+        };
+
+        let def = match node.definition_location() {
+            Some(loc) => loc,
+            None => return Ok(None),
+        };
+
+        let range = span_to_lsp_range(def.span, &line_numbers);
+
+        let name = match &node {
+            aiken_lang::ast::Located::Definition(def) => match def {
+                aiken_lang::ast::Definition::Fn(f) => f.name.clone(),
+                aiken_lang::ast::Definition::Test(t) => t.name.clone(),
+                aiken_lang::ast::Definition::Benchmark(b) => b.name.clone(),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+
+        Ok(Some(vec![lsp_types::CallHierarchyItem {
+            name,
+            kind: lsp_types::SymbolKind::FUNCTION,
+            tags: None,
+            detail: None,
+            uri: params.text_document.uri,
+            range,
+            selection_range: range,
+            data: None,
+        }]))
+    }
+
+    /// Walk a typed expression tree and collect all `Call` nodes
+    fn collect_calls_in_expr<'a>(
+        expr: &'a aiken_lang::expr::TypedExpr,
+        calls: &mut Vec<&'a aiken_lang::expr::TypedExpr>,
+    ) {
+        if matches!(expr, aiken_lang::expr::TypedExpr::Call { .. }) {
+            calls.push(expr);
+        }
+
+        match expr {
+            aiken_lang::expr::TypedExpr::Call { fun, args, .. } => {
+                Self::collect_calls_in_expr(fun, calls);
+                for arg in args {
+                    Self::collect_calls_in_expr(&arg.value, calls);
+                }
+            }
+            aiken_lang::expr::TypedExpr::Sequence { expressions, .. }
+            | aiken_lang::expr::TypedExpr::Pipeline { expressions, .. } => {
+                for e in expressions {
+                    Self::collect_calls_in_expr(e, calls);
+                }
+            }
+            aiken_lang::expr::TypedExpr::Assignment { value, .. } => {
+                Self::collect_calls_in_expr(value, calls);
+            }
+            aiken_lang::expr::TypedExpr::When {
+                subject, clauses, ..
+            } => {
+                Self::collect_calls_in_expr(subject, calls);
+                for clause in clauses {
+                    Self::collect_calls_in_expr(&clause.then, calls);
+                }
+            }
+            aiken_lang::expr::TypedExpr::If {
+                branches,
+                final_else,
+                ..
+            } => {
+                for branch in branches.iter() {
+                    Self::collect_calls_in_expr(&branch.body, calls);
+                }
+                Self::collect_calls_in_expr(final_else, calls);
+            }
+            aiken_lang::expr::TypedExpr::Trace { then, text, .. } => {
+                Self::collect_calls_in_expr(then, calls);
+                Self::collect_calls_in_expr(text, calls);
+            }
+            aiken_lang::expr::TypedExpr::RecordAccess { record, .. }
+            | aiken_lang::expr::TypedExpr::TupleIndex {
+                tuple: record, ..
+            } => {
+                Self::collect_calls_in_expr(record, calls);
+            }
+            aiken_lang::expr::TypedExpr::RecordUpdate {
+                spread, args, ..
+            } => {
+                Self::collect_calls_in_expr(spread, calls);
+                for arg in args {
+                    Self::collect_calls_in_expr(&arg.value, calls);
+                }
+            }
+            aiken_lang::expr::TypedExpr::Tuple { elems, .. } => {
+                for e in elems {
+                    Self::collect_calls_in_expr(e, calls);
+                }
+            }
+            aiken_lang::expr::TypedExpr::List { elements, tail, .. } => {
+                for e in elements {
+                    Self::collect_calls_in_expr(e, calls);
+                }
+                if let Some(t) = tail {
+                    Self::collect_calls_in_expr(t, calls);
+                }
+            }
+            aiken_lang::expr::TypedExpr::Pair { fst, snd, .. } => {
+                Self::collect_calls_in_expr(fst, calls);
+                Self::collect_calls_in_expr(snd, calls);
+            }
+            aiken_lang::expr::TypedExpr::Fn { body, .. } => {
+                Self::collect_calls_in_expr(body, calls);
+            }
+            aiken_lang::expr::TypedExpr::BinOp {
+                left, right, ..
+            } => {
+                Self::collect_calls_in_expr(left, calls);
+                Self::collect_calls_in_expr(right, calls);
+            }
+            aiken_lang::expr::TypedExpr::UnOp { value, .. } => {
+                Self::collect_calls_in_expr(value, calls);
+            }
+            _ => {}
+        }
+    }
+
+    /// Extract (module, name) from the callee expression of a `Call`.
+    fn callee_module_and_name(
+        expr: &aiken_lang::expr::TypedExpr,
+    ) -> Option<(String, String)> {
+        match expr {
+            aiken_lang::expr::TypedExpr::Var {
+                constructor, ..
+            } => match &constructor.variant {
+                ValueConstructorVariant::ModuleFn { module, name, .. } => {
+                    Some((module.clone(), name.clone()))
+                }
+                ValueConstructorVariant::ModuleConstant { module, name, .. } => {
+                    Some((module.clone(), name.clone()))
+                }
+                _ => None,
+            },
+            aiken_lang::expr::TypedExpr::ModuleSelect {
+                constructor, ..
+            } => match constructor {
+                ModuleValueConstructor::Fn { module, name, .. } => {
+                    Some((module.clone(), name.clone()))
+                }
+                ModuleValueConstructor::Constant { module, name, .. } => {
+                    Some((module.clone(), name.clone()))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Call hierarchy incoming: find all callers of a function across all modules.
+    #[allow(clippy::result_large_err)]
+    fn call_hierarchy_incoming(
+        &self,
+        params: lsp_types::CallHierarchyIncomingCallsParams,
+    ) -> Result<Option<Vec<lsp_types::CallHierarchyIncomingCall>>, ServerError> {
+        let item = params.item;
+        let target_name = &item.name;
+        let target_module = crate::utils::uri_to_module_name(&item.uri, &self.root);
+
+        let compiler = match &self.compiler {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        let mut results: Vec<lsp_types::CallHierarchyIncomingCall> = Vec::new();
+
+        for (module_name, checked_module) in &compiler.modules {
+            let line_numbers = LineNumbers::new(&checked_module.code);
+
+            let Some(module_uri) = self.module_name_to_uri(module_name) else {
+                continue;
+            };
+
+            for def in &checked_module.ast.definitions {
+                let (enclosing_name, body, enclosing_location) = match def {
+                    Definition::Fn(f) => (f.name.clone(), &f.body, f.location),
+                    Definition::Test(t) => (t.name.clone(), &t.body, t.location),
+                    Definition::Benchmark(b) => (b.name.clone(), &b.body, b.location),
+                    _ => continue,
+                };
+
+                let mut calls = Vec::new();
+                Self::collect_calls_in_expr(body, &mut calls);
+
+                let mut call_ranges: Vec<lsp_types::Range> = Vec::new();
+
+                for call in &calls {
+                    let aiken_lang::expr::TypedExpr::Call { fun, location, .. } = call
+                    else {
+                        continue;
+                    };
+
+                    if let Some((callee_module, callee_name)) =
+                        Self::callee_module_and_name(fun)
+                    {
+                        let module_matches = match &target_module {
+                            Some(tm) => callee_module == *tm,
+                            None => true,
+                        };
+
+                        if module_matches && callee_name == *target_name {
+                            let range = span_to_lsp_range(*location, &line_numbers);
+                            call_ranges.push(range);
+                        }
+                    }
+                }
+
+                if !call_ranges.is_empty() {
+                    let caller_range =
+                        span_to_lsp_range(enclosing_location, &line_numbers);
+                    results.push(lsp_types::CallHierarchyIncomingCall {
+                        from: lsp_types::CallHierarchyItem {
+                            name: enclosing_name,
+                            kind: lsp_types::SymbolKind::FUNCTION,
+                            tags: None,
+                            detail: None,
+                            uri: module_uri.clone(),
+                            range: caller_range,
+                            selection_range: caller_range,
+                            data: None,
+                        },
+                        from_ranges: call_ranges,
+                    });
+                }
+            }
+        }
+
+        if results.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(results))
+        }
+    }
+
+    /// Call hierarchy outgoing: find all callees within a function body.
+    #[allow(clippy::result_large_err)]
+    fn call_hierarchy_outgoing(
+        &self,
+        params: lsp_types::CallHierarchyOutgoingCallsParams,
+    ) -> Result<Option<Vec<lsp_types::CallHierarchyOutgoingCall>>, ServerError> {
+        let item = params.item;
+        let function_name = &item.name;
+
+        let module_name =
+            match crate::utils::uri_to_module_name(&item.uri, &self.root) {
+                Some(m) => m,
+                None => return Ok(None),
+            };
+
+        let compiler = match &self.compiler {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        let checked_module = match compiler.modules.get(&module_name) {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+
+        let line_numbers = LineNumbers::new(&checked_module.code);
+
+        let body = match checked_module
+            .ast
+            .definitions
+            .iter()
+            .find_map(|def| match def {
+                Definition::Fn(f) if f.name == *function_name => Some(&f.body),
+                Definition::Test(t) if t.name == *function_name => Some(&t.body),
+                Definition::Benchmark(b) if b.name == *function_name => {
+                    Some(&b.body)
+                }
+                _ => None,
+            }) {
+            Some(body) => body,
+            None => return Ok(None),
+        };
+
+        let mut calls = Vec::new();
+        Self::collect_calls_in_expr(body, &mut calls);
+
+        let mut callee_map: HashMap<
+            (String, String),
+            Vec<lsp_types::Range>,
+        > = HashMap::new();
+
+        for call in &calls {
+            let aiken_lang::expr::TypedExpr::Call { fun, location, .. } = call
+            else {
+                continue;
+            };
+
+            if let Some((callee_module, callee_name)) =
+                Self::callee_module_and_name(fun)
+            {
+                let range = span_to_lsp_range(*location, &line_numbers);
+                callee_map
+                    .entry((callee_module, callee_name))
+                    .or_default()
+                    .push(range);
+            }
+        }
+
+        let mut results = Vec::new();
+
+        for ((callee_module, callee_name), from_ranges) in callee_map {
+            let callee_uri = self.module_name_to_uri(&callee_module);
+
+            if let Some(uri) = callee_uri {
+                results.push(lsp_types::CallHierarchyOutgoingCall {
+                    to: lsp_types::CallHierarchyItem {
+                        name: callee_name,
+                        kind: lsp_types::SymbolKind::FUNCTION,
+                        tags: None,
+                        detail: None,
+                        uri,
+                        range: lsp_types::Range::default(),
+                        selection_range: lsp_types::Range::default(),
+                        data: None,
+                    },
+                    from_ranges,
+                });
+            }
+        }
+
+        if results.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(results))
+        }
     }
 
     #[allow(clippy::result_large_err)]
@@ -469,8 +1910,8 @@ impl Server {
                     None => return Ok(None),
                 };
 
-                let url = url::Url::parse(&format!("file:///{}", &module.path))
-                    .expect("goto definition URL parse");
+                let url =
+                    url::Url::from_file_path(&module.path).expect("goto definition URL parse");
 
                 (url, &module.line_numbers)
             }
@@ -481,7 +1922,7 @@ impl Server {
         Ok(Some(lsp_types::Location { uri, range }))
     }
 
-    fn node_at_position(
+    pub(crate) fn node_at_position(
         &self,
         params: &lsp_types::TextDocumentPositionParams,
     ) -> Option<(LineNumbers, Located<'_>)> {
@@ -499,7 +1940,7 @@ impl Server {
         Some((line_numbers, node))
     }
 
-    fn module_for_uri(&self, uri: &url::Url) -> Option<&CheckedModule> {
+    pub(crate) fn module_for_uri(&self, uri: &url::Url) -> Option<&CheckedModule> {
         self.compiler.as_ref().and_then(|compiler| {
             let module_name = uri_to_module_name(uri, &self.root).expect("uri to module name");
             compiler.modules.get(&module_name)
@@ -568,36 +2009,822 @@ impl Server {
     }
 
     #[allow(clippy::result_large_err)]
+    fn document_symbols(
+        &self,
+        params: lsp_types::DocumentSymbolParams,
+    ) -> Result<Option<lsp_types::DocumentSymbolResponse>, ServerError> {
+        let module = match self.module_for_uri(&params.text_document.uri) {
+            Some(module) => module,
+            None => return Ok(None),
+        };
+
+        let line_numbers = LineNumbers::new(&module.code);
+        let mut symbols = Vec::new();
+
+        // Extract symbols from module definitions
+        for definition in &module.ast.definitions {
+            if let Some(symbol) = self.definition_to_symbol(definition, &line_numbers, &module.code)
+            {
+                symbols.push(symbol);
+            }
+        }
+
+        Ok(Some(lsp_types::DocumentSymbolResponse::Nested(symbols)))
+    }
+
+    /// Find all references to a symbol at the given position
+    #[allow(clippy::result_large_err)]
+    fn references(
+        &self,
+        params: lsp_types::ReferenceParams,
+    ) -> Result<Option<Vec<lsp_types::Location>>, ServerError> {
+        let compiler = match &self.compiler {
+            Some(compiler) => compiler,
+            None => return Ok(None),
+        };
+
+        let module = match self.module_for_uri(&params.text_document_position.text_document.uri) {
+            Some(module) => module,
+            None => return Ok(None),
+        };
+
+        let line_numbers = LineNumbers::new(&module.code);
+
+        // Find the symbol at the given position
+        let target = match self.find_symbol_at_position(
+            &params.text_document_position.position,
+            module,
+            &line_numbers,
+        ) {
+            Some(target) => target,
+            None => return Ok(None),
+        };
+
+        let mut references = Vec::new();
+
+        // Search through all modules for references to this symbol
+        for (module_name, checked_module) in &compiler.modules {
+            if let Some(module_refs) =
+                self.find_references_in_module(&target, checked_module, module_name)
+            {
+                references.extend(module_refs);
+            }
+        }
+
+        // Include the definition itself if requested
+        if params.context.include_declaration {
+            let def_mod_name = target.def_module.as_deref().unwrap_or(&module.name);
+
+            if let Some(def_mod) = compiler.modules.get(def_mod_name)
+                && let Some(uri) = self.module_name_to_uri(def_mod_name)
+            {
+                let def_ln = LineNumbers::new(&def_mod.code);
+                let range = span_to_lsp_range(target.def_span, &def_ln);
+                references.push(lsp_types::Location { uri, range });
+            }
+        }
+
+        Ok(Some(references))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn selection_range(
+        &self,
+        params: lsp_types::SelectionRangeParams,
+    ) -> Result<Option<Vec<lsp_types::SelectionRange>>, ServerError> {
+        let module = match self.module_for_uri(&params.text_document.uri) {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        let line_numbers = aiken_lang::line_numbers::LineNumbers::new(&module.code);
+        let source = &module.code;
+        let mut ranges = Vec::new();
+
+        for position in params.positions {
+            let byte_index =
+                line_numbers.byte_index(position.line as usize, position.character as usize);
+            if let Some(node) = module.find_node(byte_index) {
+                let range = build_selection_range(&node, &line_numbers, source);
+                ranges.push(range);
+            }
+        }
+
+        Ok(if ranges.is_empty() {
+            None
+        } else {
+            Some(ranges)
+        })
+    }
+
+    /// Convert an Aiken definition to LSP DocumentSymbol
+    #[allow(deprecated)]
+    fn definition_to_symbol(
+        &self,
+        definition: &TypedDefinition,
+        line_numbers: &LineNumbers,
+        source: &str,
+    ) -> Option<DocumentSymbol> {
+        use aiken_lang::ast::Definition;
+
+        /// Helper to narrow a span to just the identifier name
+        fn identifier_span(source: &str, span: Span, name: &str) -> Option<Span> {
+            let text = &source[span.start..span.end];
+            let offset = text.find(name)?;
+            Some(Span {
+                start: span.start + offset,
+                end: span.start + offset + name.len(),
+            })
+        }
+
+        match definition {
+            Definition::Fn(function) => {
+                let range = span_to_lsp_range(function.location, line_numbers);
+                let selection_range = identifier_span(source, function.location, &function.name)
+                    .map(|s| span_to_lsp_range(s, line_numbers))
+                    .unwrap_or_else(|| span_to_lsp_range(function.location, line_numbers));
+
+                let mut vars = Vec::new();
+                collect_let_vars(&function.body, line_numbers, &mut vars);
+
+                Some(DocumentSymbol {
+                    name: function.name.clone(),
+                    detail: Some(format!("fn {}", function.name)),
+                    kind: SymbolKind::FUNCTION,
+                    tags: None,
+                    deprecated: None,
+                    range,
+                    selection_range,
+                    children: if vars.is_empty() { None } else { Some(vars) },
+                })
+            }
+            Definition::Test(test) => {
+                let range = span_to_lsp_range(test.location, line_numbers);
+                let selection_range = identifier_span(source, test.location, &test.name)
+                    .map(|s| span_to_lsp_range(s, line_numbers))
+                    .unwrap_or_else(|| span_to_lsp_range(test.location, line_numbers));
+
+                let mut vars = Vec::new();
+                collect_let_vars(&test.body, line_numbers, &mut vars);
+
+                Some(DocumentSymbol {
+                    name: test.name.clone(),
+                    detail: Some(format!("test {}", test.name)),
+                    kind: SymbolKind::METHOD,
+                    tags: None,
+                    deprecated: None,
+                    range,
+                    selection_range,
+                    children: if vars.is_empty() { None } else { Some(vars) },
+                })
+            }
+            Definition::Benchmark(benchmark) => {
+                let range = span_to_lsp_range(benchmark.location, line_numbers);
+                let selection_range = identifier_span(source, benchmark.location, &benchmark.name)
+                    .map(|s| span_to_lsp_range(s, line_numbers))
+                    .unwrap_or_else(|| span_to_lsp_range(benchmark.location, line_numbers));
+
+                let mut vars = Vec::new();
+                collect_let_vars(&benchmark.body, line_numbers, &mut vars);
+
+                Some(DocumentSymbol {
+                    name: benchmark.name.clone(),
+                    detail: Some(format!("benchmark {}", benchmark.name)),
+                    kind: SymbolKind::METHOD,
+                    tags: None,
+                    deprecated: None,
+                    range,
+                    selection_range,
+                    children: if vars.is_empty() { None } else { Some(vars) },
+                })
+            }
+            Definition::TypeAlias(type_alias) => {
+                let range = span_to_lsp_range(type_alias.location, line_numbers);
+                let selection_range =
+                    identifier_span(source, type_alias.location, &type_alias.alias)
+                        .map(|s| span_to_lsp_range(s, line_numbers))
+                        .unwrap_or_else(|| span_to_lsp_range(type_alias.location, line_numbers));
+
+                Some(DocumentSymbol {
+                    name: type_alias.alias.clone(),
+                    detail: Some(format!("type {}", type_alias.alias)),
+                    kind: SymbolKind::CLASS,
+                    tags: None,
+                    deprecated: None,
+                    range,
+                    selection_range,
+                    children: None,
+                })
+            }
+            Definition::DataType(data_type) => {
+                let range = span_to_lsp_range(data_type.location, line_numbers);
+                let selection_range = identifier_span(source, data_type.location, &data_type.name)
+                    .map(|s| span_to_lsp_range(s, line_numbers))
+                    .unwrap_or_else(|| span_to_lsp_range(data_type.location, line_numbers));
+
+                // Create child symbols for constructors
+                let mut children = Vec::new();
+                for constructor in &data_type.constructors {
+                    let constructor_range = span_to_lsp_range(constructor.location, line_numbers);
+                    let constructor_selection_range =
+                        identifier_span(source, constructor.location, &constructor.name)
+                            .map(|s| span_to_lsp_range(s, line_numbers))
+                            .unwrap_or_else(|| {
+                                span_to_lsp_range(constructor.location, line_numbers)
+                            });
+
+                    children.push(DocumentSymbol {
+                        name: constructor.name.clone(),
+                        detail: Some(format!("constructor {}", constructor.name)),
+                        kind: SymbolKind::CONSTRUCTOR,
+                        tags: None,
+                        deprecated: None,
+                        range: constructor_range,
+                        selection_range: constructor_selection_range,
+                        children: None,
+                    });
+                }
+
+                Some(DocumentSymbol {
+                    name: data_type.name.clone(),
+                    detail: Some(format!("type {}", data_type.name)),
+                    kind: SymbolKind::CLASS,
+                    tags: None,
+                    deprecated: None,
+                    range,
+                    selection_range,
+                    children: if children.is_empty() {
+                        None
+                    } else {
+                        Some(children)
+                    },
+                })
+            }
+            Definition::ModuleConstant(constant) => {
+                let range = span_to_lsp_range(constant.location, line_numbers);
+                let selection_range = identifier_span(source, constant.location, &constant.name)
+                    .map(|s| span_to_lsp_range(s, line_numbers))
+                    .unwrap_or_else(|| span_to_lsp_range(constant.location, line_numbers));
+
+                Some(DocumentSymbol {
+                    name: constant.name.clone(),
+                    detail: Some(format!("const {}", constant.name)),
+                    kind: SymbolKind::CONSTANT,
+                    tags: None,
+                    deprecated: None,
+                    range,
+                    selection_range,
+                    children: None,
+                })
+            }
+            Definition::Validator(validator) => {
+                let range = span_to_lsp_range(validator.location, line_numbers);
+                let selection_range = identifier_span(source, validator.location, &validator.name)
+                    .map(|s| span_to_lsp_range(s, line_numbers))
+                    .unwrap_or_else(|| span_to_lsp_range(validator.location, line_numbers));
+
+                // Create child symbols for handlers
+                let mut children = Vec::new();
+                for handler in &validator.handlers {
+                    let handler_range = span_to_lsp_range(handler.location, line_numbers);
+                    let handler_selection_range =
+                        identifier_span(source, handler.location, &handler.name)
+                            .map(|s| span_to_lsp_range(s, line_numbers))
+                            .unwrap_or_else(|| {
+                                span_to_lsp_range(handler.location, line_numbers)
+                            });
+
+                    children.push(DocumentSymbol {
+                        name: handler.name.clone(),
+                        detail: Some(format!("handler {}", handler.name)),
+                        kind: SymbolKind::FUNCTION,
+                        tags: None,
+                        deprecated: None,
+                        range: handler_range,
+                        selection_range: handler_selection_range,
+                        children: None,
+                    });
+                }
+
+                // Add fallback handler
+                let fallback = &validator.fallback;
+                let fallback_range = span_to_lsp_range(fallback.location, line_numbers);
+                let fallback_selection_range =
+                    identifier_span(source, fallback.location, &fallback.name)
+                        .map(|s| span_to_lsp_range(s, line_numbers))
+                        .unwrap_or_else(|| {
+                            span_to_lsp_range(fallback.location, line_numbers)
+                        });
+
+                children.push(DocumentSymbol {
+                    name: fallback.name.clone(),
+                    detail: Some(format!("handler {}", fallback.name)),
+                    kind: SymbolKind::FUNCTION,
+                    tags: None,
+                    deprecated: None,
+                    range: fallback_range,
+                    selection_range: fallback_selection_range,
+                    children: None,
+                });
+
+                Some(DocumentSymbol {
+                    name: validator.name.clone(),
+                    detail: Some(format!("validator {}", validator.name)),
+                    kind: SymbolKind::CLASS,
+                    tags: None,
+                    deprecated: None,
+                    range,
+                    selection_range,
+                    children: if children.is_empty() {
+                        None
+                    } else {
+                        Some(children)
+                    },
+                })
+            }
+            Definition::Use(_) => {
+                // Skip use statements for document symbols
+                None
+            }
+        }
+    }
+
+    /// Find the symbol target at the given position in a module
+    pub(crate) fn find_symbol_at_position(
+        &self,
+        position: &lsp_types::Position,
+        module: &CheckedModule,
+        line_numbers: &LineNumbers,
+    ) -> Option<SymbolTarget> {
+        // Convert LSP position to byte offset using LineNumbers API
+        let byte_index =
+            line_numbers.byte_index(position.line as usize, position.character as usize);
+
+        // Use the existing find_node functionality to get the node at position
+        if let Some(node) = module.find_node(byte_index) {
+            return self.extract_symbol_target_from_node(node, byte_index, &module.name);
+        }
+
+        None
+    }
+
+    /// Extract symbol target from a Located node, ensuring the byte_index is within the symbol's span
+    fn extract_symbol_target_from_node(
+        &self,
+        node: Located<'_>,
+        byte_index: usize,
+        module_name: &str,
+    ) -> Option<SymbolTarget> {
+        match node {
+            Located::Expression(aiken_lang::expr::TypedExpr::Var {
+                name,
+                constructor,
+                location,
+                ..
+            }) => {
+                if byte_index >= location.start && byte_index <= location.end {
+                    let def_loc = constructor.definition_location();
+
+                    Some(SymbolTarget {
+                        name: name.clone(),
+                        def_module: def_loc.module.map(|s| s.to_string()),
+                        def_span: def_loc.span,
+                        origin_module: module_name.to_string(),
+                    })
+                } else {
+                    None
+                }
+            }
+            Located::Definition(def) => match def {
+                Definition::Fn(function) => {
+                    if byte_index >= function.location.start && byte_index <= function.location.end
+                    {
+                        Some(SymbolTarget {
+                            name: function.name.clone(),
+                            def_module: Some(module_name.to_string()),
+                            def_span: function.location,
+                            origin_module: module_name.to_string(),
+                        })
+                    } else {
+                        None
+                    }
+                }
+                Definition::DataType(data_type) => {
+                    if byte_index >= data_type.location.start
+                        && byte_index <= data_type.location.end
+                    {
+                        Some(SymbolTarget {
+                            name: data_type.name.clone(),
+                            def_module: Some(module_name.to_string()),
+                            def_span: data_type.location,
+                            origin_module: module_name.to_string(),
+                        })
+                    } else {
+                        None
+                    }
+                }
+                Definition::TypeAlias(type_alias) => {
+                    if byte_index >= type_alias.location.start
+                        && byte_index <= type_alias.location.end
+                    {
+                        Some(SymbolTarget {
+                            name: type_alias.alias.clone(),
+                            def_module: Some(module_name.to_string()),
+                            def_span: type_alias.location,
+                            origin_module: module_name.to_string(),
+                        })
+                    } else {
+                        None
+                    }
+                }
+                Definition::ModuleConstant(constant) => {
+                    if byte_index >= constant.location.start && byte_index <= constant.location.end
+                    {
+                        Some(SymbolTarget {
+                            name: constant.name.clone(),
+                            def_module: Some(module_name.to_string()),
+                            def_span: constant.location,
+                            origin_module: module_name.to_string(),
+                        })
+                    } else {
+                        None
+                    }
+                }
+                Definition::Validator(validator) => {
+                    if byte_index >= validator.location.start
+                        && byte_index <= validator.location.end
+                    {
+                        Some(SymbolTarget {
+                            name: validator.name.clone(),
+                            def_module: Some(module_name.to_string()),
+                            def_span: validator.location,
+                            origin_module: module_name.to_string(),
+                        })
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Convert module name to URI
+    pub(crate) fn module_name_to_uri(&self, module_name: &str) -> Option<url::Url> {
+        if let Some(compiler) = &self.compiler
+            && let Some(source) = compiler.sources.get(module_name)
+        {
+            return url::Url::from_file_path(&source.path).ok();
+        }
+        None
+    }
+
+    /// Find all references to a symbol in a module
+    pub(crate) fn find_references_in_module(
+        &self,
+        target: &SymbolTarget,
+        module: &CheckedModule,
+        module_name: &str,
+    ) -> Option<Vec<lsp_types::Location>> {
+        let mut locations = Vec::new();
+        let line_numbers = LineNumbers::new(&module.code);
+
+        // Search through module definitions
+        for definition in &module.ast.definitions {
+            self.find_references_in_definition(
+                target,
+                definition,
+                &line_numbers,
+                module_name,
+                &mut locations,
+            );
+        }
+
+        if locations.is_empty() {
+            None
+        } else {
+            Some(locations)
+        }
+    }
+
+    /// Find references to a symbol in a definition
+    fn find_references_in_definition(
+        &self,
+        target: &SymbolTarget,
+        definition: &TypedDefinition,
+        line_numbers: &LineNumbers,
+        module_name: &str,
+        locations: &mut Vec<lsp_types::Location>,
+    ) {
+        match definition {
+            Definition::Fn(function) => {
+                self.find_references_in_expr(
+                    target,
+                    &function.body,
+                    line_numbers,
+                    module_name,
+                    locations,
+                );
+            }
+            Definition::Validator(validator) => {
+                for handler in &validator.handlers {
+                    self.find_references_in_expr(
+                        target,
+                        &handler.body,
+                        line_numbers,
+                        module_name,
+                        locations,
+                    );
+                }
+
+                self.find_references_in_expr(
+                    target,
+                    &validator.fallback.body,
+                    line_numbers,
+                    module_name,
+                    locations,
+                );
+            }
+            Definition::Test(test) => {
+                self.find_references_in_expr(
+                    target,
+                    &test.body,
+                    line_numbers,
+                    module_name,
+                    locations,
+                );
+            }
+            Definition::Benchmark(benchmark) => {
+                self.find_references_in_expr(
+                    target,
+                    &benchmark.body,
+                    line_numbers,
+                    module_name,
+                    locations,
+                );
+            }
+            Definition::ModuleConstant(constant) => {
+                self.find_references_in_expr(
+                    target,
+                    &constant.value,
+                    line_numbers,
+                    module_name,
+                    locations,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// Find references to a symbol in an expression
+    fn find_references_in_expr(
+        &self,
+        target: &SymbolTarget,
+        expr: &aiken_lang::expr::TypedExpr,
+        line_numbers: &LineNumbers,
+        module_name: &str,
+        locations: &mut Vec<lsp_types::Location>,
+    ) {
+        match expr {
+            aiken_lang::expr::TypedExpr::Var {
+                name,
+                constructor,
+                location,
+                ..
+            } => {
+                let def_loc = constructor.definition_location();
+                let var_def_module = def_loc.module.map(|s| s.to_string());
+
+                if name == &target.name
+                    && var_def_module == target.def_module
+                    && def_loc.span == target.def_span
+                    && (var_def_module.is_some() || module_name == target.origin_module)
+                    && let Some(uri) = self.module_name_to_uri(module_name)
+                {
+                    let range = span_to_lsp_range(*location, line_numbers);
+                    locations.push(lsp_types::Location { uri, range });
+                }
+            }
+            aiken_lang::expr::TypedExpr::ModuleSelect {
+                module_name: selected_module,
+                constructor,
+                label,
+                location,
+                ..
+            } => {
+                if label == &target.name
+                    && Some(selected_module.clone()) == target.def_module
+                    && constructor.location() == target.def_span
+                    && let Some(uri) = self.module_name_to_uri(module_name)
+                {
+                    let range = span_to_lsp_range(*location, line_numbers);
+                    locations.push(lsp_types::Location { uri, range });
+                }
+            }
+            aiken_lang::expr::TypedExpr::Call { fun, args, .. } => {
+                self.find_references_in_expr(target, fun, line_numbers, module_name, locations);
+                for arg in args {
+                    self.find_references_in_expr(
+                        target,
+                        &arg.value,
+                        line_numbers,
+                        module_name,
+                        locations,
+                    );
+                }
+            }
+            aiken_lang::expr::TypedExpr::Sequence { expressions, .. } => {
+                for expr in expressions {
+                    self.find_references_in_expr(
+                        target,
+                        expr,
+                        line_numbers,
+                        module_name,
+                        locations,
+                    );
+                }
+            }
+            aiken_lang::expr::TypedExpr::Pipeline { expressions, .. } => {
+                for expr in expressions.iter() {
+                    self.find_references_in_expr(
+                        target,
+                        expr,
+                        line_numbers,
+                        module_name,
+                        locations,
+                    );
+                }
+            }
+            aiken_lang::expr::TypedExpr::Fn { body, .. } => {
+                self.find_references_in_expr(target, body, line_numbers, module_name, locations);
+            }
+            aiken_lang::expr::TypedExpr::List { elements, tail, .. } => {
+                for elem in elements {
+                    self.find_references_in_expr(
+                        target,
+                        elem,
+                        line_numbers,
+                        module_name,
+                        locations,
+                    );
+                }
+
+                if let Some(tail) = tail {
+                    self.find_references_in_expr(
+                        target,
+                        tail,
+                        line_numbers,
+                        module_name,
+                        locations,
+                    );
+                }
+            }
+            aiken_lang::expr::TypedExpr::BinOp { left, right, .. } => {
+                self.find_references_in_expr(target, left, line_numbers, module_name, locations);
+                self.find_references_in_expr(target, right, line_numbers, module_name, locations);
+            }
+            aiken_lang::expr::TypedExpr::Assignment { value, .. } => {
+                self.find_references_in_expr(target, value, line_numbers, module_name, locations);
+            }
+            aiken_lang::expr::TypedExpr::Trace { then, text, .. } => {
+                self.find_references_in_expr(target, then, line_numbers, module_name, locations);
+                self.find_references_in_expr(target, text, line_numbers, module_name, locations);
+            }
+            aiken_lang::expr::TypedExpr::When {
+                subject, clauses, ..
+            } => {
+                self.find_references_in_expr(target, subject, line_numbers, module_name, locations);
+
+                for clause in clauses {
+                    self.find_references_in_expr(
+                        target,
+                        &clause.then,
+                        line_numbers,
+                        module_name,
+                        locations,
+                    );
+                }
+            }
+            aiken_lang::expr::TypedExpr::If {
+                branches,
+                final_else,
+                ..
+            } => {
+                for branch in branches.iter() {
+                    self.find_references_in_expr(
+                        target,
+                        &branch.condition,
+                        line_numbers,
+                        module_name,
+                        locations,
+                    );
+
+                    self.find_references_in_expr(
+                        target,
+                        &branch.body,
+                        line_numbers,
+                        module_name,
+                        locations,
+                    );
+                }
+
+                self.find_references_in_expr(
+                    target,
+                    final_else,
+                    line_numbers,
+                    module_name,
+                    locations,
+                );
+            }
+            aiken_lang::expr::TypedExpr::RecordAccess { record, .. } => {
+                self.find_references_in_expr(target, record, line_numbers, module_name, locations);
+            }
+            aiken_lang::expr::TypedExpr::Tuple { elems, .. } => {
+                for elem in elems {
+                    self.find_references_in_expr(
+                        target,
+                        elem,
+                        line_numbers,
+                        module_name,
+                        locations,
+                    );
+                }
+            }
+            aiken_lang::expr::TypedExpr::Pair { fst, snd, .. } => {
+                self.find_references_in_expr(target, fst, line_numbers, module_name, locations);
+                self.find_references_in_expr(target, snd, line_numbers, module_name, locations);
+            }
+            aiken_lang::expr::TypedExpr::TupleIndex { tuple, .. } => {
+                self.find_references_in_expr(target, tuple, line_numbers, module_name, locations);
+            }
+            aiken_lang::expr::TypedExpr::RecordUpdate { spread, args, .. } => {
+                self.find_references_in_expr(target, spread, line_numbers, module_name, locations);
+
+                for arg in args {
+                    self.find_references_in_expr(
+                        target,
+                        &arg.value,
+                        line_numbers,
+                        module_name,
+                        locations,
+                    );
+                }
+            }
+            aiken_lang::expr::TypedExpr::UnOp { value, .. } => {
+                self.find_references_in_expr(target, value, line_numbers, module_name, locations);
+            }
+            _ => {}
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
     pub fn listen(&mut self, connection: Connection) -> Result<(), ServerError> {
         self.create_compilation_progress_token(&connection)?;
         self.start_watching_aiken_toml(&connection)?;
 
-        // Compile the project once so we have all the state and any initial errors
-        self.compile(&connection)?;
-        self.publish_stored_diagnostics(&connection)?;
+        self.notify_client_of_compilation_start(&connection)?;
+        self.spawn_compile();
 
-        for msg in &connection.receiver {
-            tracing::debug!("Got message: {:#?}", msg);
-
-            match msg {
-                Message::Request(req) => {
+        loop {
+            self.poll_compile_result(&connection)?;
+            self.try_debounced_compile(&connection)?;
+            match connection
+                .receiver
+                .recv_timeout(std::time::Duration::from_millis(50))
+            {
+                Ok(lsp_server::Message::Request(req)) => {
                     if connection.handle_shutdown(&req)? {
                         return Ok(());
                     }
-
-                    tracing::debug!("Get request: {:#?}", req);
-
                     let response = self.handle_request(req, &connection)?;
-
-                    connection.sender.send(Message::Response(response))?;
+                    connection
+                        .sender
+                        .send(lsp_server::Message::Response(response))?;
                 }
-                Message::Response(_) => (),
-                Message::Notification(notification) => {
-                    self.handle_notification(&connection, notification)?
+                Ok(lsp_server::Message::Response(_)) => (),
+                Ok(lsp_server::Message::Notification(notification)) => {
+                    self.handle_notification(&connection, notification)?;
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    return Ok(());
                 }
             }
         }
+    }
 
+    /// Start a compile if enough time has passed since the last DidChange.
+    /// Uses a 300ms debounce to avoid recompiling on every keystroke.
+    #[allow(clippy::result_large_err)]
+    fn try_debounced_compile(&mut self, connection: &Connection) -> Result<(), ServerError> {
+        const DEBOUNCE_MS: u64 = 300;
+        if let Some(last) = self.last_change
+            && last.elapsed() >= std::time::Duration::from_millis(DEBOUNCE_MS)
+        {
+            self.last_change = None;
+            self.notify_client_of_compilation_start(connection)?;
+            self.spawn_compile();
+        }
         Ok(())
     }
 
@@ -615,6 +2842,9 @@ impl Server {
             stored_diagnostics: HashMap::new(),
             stored_messages: Vec::new(),
             compiler: None,
+            pending_compile: None,
+            files_changed_since_compile: HashSet::new(),
+            last_change: None,
         };
 
         server.create_new_compiler();
@@ -658,102 +2888,11 @@ impl Server {
     where
         E: Diagnostic + GetSource + ExtraData,
     {
-        let (severity, typ) = match error.severity() {
-            Some(severity) => match severity {
-                miette::Severity::Error => (
-                    lsp_types::DiagnosticSeverity::ERROR,
-                    lsp_types::MessageType::ERROR,
-                ),
-                miette::Severity::Warning => (
-                    lsp_types::DiagnosticSeverity::WARNING,
-                    lsp_types::MessageType::WARNING,
-                ),
-                miette::Severity::Advice => (
-                    lsp_types::DiagnosticSeverity::HINT,
-                    lsp_types::MessageType::INFO,
-                ),
-            },
-            None => (
-                lsp_types::DiagnosticSeverity::ERROR,
-                lsp_types::MessageType::ERROR,
-            ),
-        };
-
-        let message = match error.source() {
-            Some(err) => err.to_string(),
-            None => error.to_string(),
-        };
-
-        if let (Some(path), Some(src)) = (error.path(), error.src()) {
-            let line_numbers = LineNumbers::new(&src);
-
-            let related_labels = || {
-                error
-                    .related()
-                    .and_then(|mut iter| iter.find(|diag| diag.labels().is_some()))
-                    .and_then(|diag| diag.labels())
-            };
-
-            let lsp_range = if let Some(span) = error
-                .labels()
-                .or_else(related_labels)
-                .and_then(|mut labels| labels.next())
-            {
-                span_to_lsp_range(
-                    Span {
-                        start: span.inner().offset(),
-                        end: span.inner().offset() + span.inner().len(),
-                    },
-                    &line_numbers,
-                )
-            } else {
-                self.stored_messages
-                    .push(lsp_types::ShowMessageParams { typ, message });
-                return Ok(());
-            };
-
-            let lsp_diagnostic = lsp_types::Diagnostic {
-                range: lsp_range,
-                severity: Some(severity),
-                code: error.code().map(|c| {
-                    lsp_types::NumberOrString::String(
-                        c.to_string()
-                            .trim()
-                            .replace("Warning ", "")
-                            .replace("Error ", ""),
-                    )
-                }),
-                code_description: None,
-                source: None,
-                message,
-                related_information: None,
-                tags: None,
-                data: error.extra_data().map(serde_json::Value::String),
-            };
-
-            #[cfg(not(target_os = "windows"))]
-            let path = path.canonicalize()?;
-
-            self.push_diagnostic(path.clone(), lsp_diagnostic.clone());
-
-            let lsp_message = if let Some(hint) = error.help() {
-                hint.to_string()
-            } else {
-                "something is off".to_string()
-            };
-
-            let lsp_hint = lsp_types::Diagnostic {
-                severity: Some(lsp_types::DiagnosticSeverity::HINT),
-                message: lsp_message,
-                ..lsp_diagnostic
-            };
-
-            self.push_diagnostic(path, lsp_hint);
-        } else {
-            self.stored_messages
-                .push(lsp_types::ShowMessageParams { typ, message })
-        }
-
+        process_diagnostic_into(
+            error,
+            &mut self.stored_diagnostics,
+            &mut self.stored_messages,
+        );
         Ok(())
     }
 
@@ -800,13 +2939,6 @@ impl Server {
         }
 
         Ok(())
-    }
-
-    fn push_diagnostic(&mut self, path: PathBuf, diagnostic: lsp_types::Diagnostic) {
-        self.stored_diagnostics
-            .entry(path)
-            .or_default()
-            .push(diagnostic);
     }
 
     #[allow(clippy::result_large_err)]
@@ -881,5 +3013,266 @@ impl Server {
             .send(lsp_server::Message::Request(request))?;
 
         Ok(())
+    }
+}
+
+fn collect_pattern_vars(
+    pattern: &aiken_lang::ast::TypedPattern,
+    line_numbers: &LineNumbers,
+    vars: &mut Vec<DocumentSymbol>,
+) {
+    use aiken_lang::ast::Pattern;
+
+    match pattern {
+        Pattern::Var { location, name } => {
+            let range = span_to_lsp_range(*location, line_numbers);
+            #[allow(deprecated)]
+            vars.push(DocumentSymbol {
+                name: name.clone(),
+                detail: Some(format!("let {name}")),
+                kind: SymbolKind::VARIABLE,
+                tags: None,
+                deprecated: None,
+                range,
+                selection_range: range,
+                children: None,
+            });
+        }
+        Pattern::Assign {
+            name,
+            location,
+            pattern,
+        } => {
+            let range = span_to_lsp_range(*location, line_numbers);
+            #[allow(deprecated)]
+            vars.push(DocumentSymbol {
+                name: name.clone(),
+                detail: Some(format!("let {name}")),
+                kind: SymbolKind::VARIABLE,
+                tags: None,
+                deprecated: None,
+                range,
+                selection_range: range,
+                children: None,
+            });
+            collect_pattern_vars(pattern, line_numbers, vars);
+        }
+        Pattern::List { elements, tail, .. } => {
+            for elem in elements {
+                collect_pattern_vars(elem, line_numbers, vars);
+            }
+            if let Some(tail) = tail {
+                collect_pattern_vars(tail, line_numbers, vars);
+            }
+        }
+        Pattern::Tuple { elems, .. } => {
+            for elem in elems {
+                collect_pattern_vars(elem, line_numbers, vars);
+            }
+        }
+        Pattern::Pair { fst, snd, .. } => {
+            collect_pattern_vars(fst, line_numbers, vars);
+            collect_pattern_vars(snd, line_numbers, vars);
+        }
+        Pattern::Constructor { arguments, .. } => {
+            for arg in arguments {
+                collect_pattern_vars(&arg.value, line_numbers, vars);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Writes edited (unsaved) file content to disk before compilation and restores
+/// the original content after compilation (even on panic).
+struct EditedFileGuard {
+    backups: Vec<(PathBuf, String)>,
+}
+
+impl EditedFileGuard {
+    fn new(edited: &HashMap<String, String>) -> Self {
+        let mut backups = Vec::new();
+        for (file_path, content) in edited {
+            let path = PathBuf::from(file_path);
+            if let Ok(original) = fs::read_to_string(&path)
+                && &original != content
+            {
+                let _ = fs::write(&path, content);
+                backups.push((path, original));
+            }
+        }
+        EditedFileGuard { backups }
+    }
+}
+
+impl Drop for EditedFileGuard {
+    fn drop(&mut self) {
+        for (path, original) in &self.backups {
+            let _ = fs::write(path, original);
+        }
+    }
+}
+
+fn collect_let_vars(
+    expr: &aiken_lang::expr::TypedExpr,
+    line_numbers: &LineNumbers,
+    vars: &mut Vec<DocumentSymbol>,
+) {
+    use aiken_lang::ast::AssignmentKind;
+    use aiken_lang::expr::TypedExpr;
+
+    match expr {
+        TypedExpr::Assignment {
+            pattern,
+            kind,
+            value,
+            ..
+        } => {
+            match kind {
+                AssignmentKind::Let { .. } | AssignmentKind::Expect { .. } => {
+                    collect_pattern_vars(pattern, line_numbers, vars);
+                }
+                AssignmentKind::Is => {}
+            }
+            collect_let_vars(value, line_numbers, vars);
+        }
+        TypedExpr::Sequence { expressions, .. } => {
+            for e in expressions {
+                collect_let_vars(e, line_numbers, vars);
+            }
+        }
+        TypedExpr::If {
+            branches,
+            final_else,
+            ..
+        } => {
+            for branch in branches.iter() {
+                if let Some((is_pattern, _)) = &branch.is {
+                    collect_pattern_vars(is_pattern, line_numbers, vars);
+                }
+                collect_let_vars(&branch.body, line_numbers, vars);
+            }
+            collect_let_vars(final_else, line_numbers, vars);
+        }
+        TypedExpr::When {
+            subject, clauses, ..
+        } => {
+            collect_let_vars(subject, line_numbers, vars);
+            for clause in clauses {
+                collect_let_vars(&clause.then, line_numbers, vars);
+            }
+        }
+        TypedExpr::Trace { then, text, .. } => {
+            collect_let_vars(then, line_numbers, vars);
+            collect_let_vars(text, line_numbers, vars);
+        }
+        TypedExpr::Call { fun, args, .. } => {
+            collect_let_vars(fun, line_numbers, vars);
+            for arg in args {
+                collect_let_vars(&arg.value, line_numbers, vars);
+            }
+        }
+        TypedExpr::BinOp { left, right, .. } => {
+            collect_let_vars(left, line_numbers, vars);
+            collect_let_vars(right, line_numbers, vars);
+        }
+        TypedExpr::List { elements, tail, .. } => {
+            for elem in elements {
+                collect_let_vars(elem, line_numbers, vars);
+            }
+            if let Some(tail) = tail {
+                collect_let_vars(tail, line_numbers, vars);
+            }
+        }
+        TypedExpr::Tuple { elems, .. } => {
+            for elem in elems {
+                collect_let_vars(elem, line_numbers, vars);
+            }
+        }
+        TypedExpr::Pair { fst, snd, .. } => {
+            collect_let_vars(fst, line_numbers, vars);
+            collect_let_vars(snd, line_numbers, vars);
+        }
+        TypedExpr::RecordAccess { record, .. } => {
+            collect_let_vars(record, line_numbers, vars);
+        }
+        TypedExpr::TupleIndex { tuple, .. } => {
+            collect_let_vars(tuple, line_numbers, vars);
+        }
+        TypedExpr::RecordUpdate { spread, args, .. } => {
+            collect_let_vars(spread, line_numbers, vars);
+            for arg in args {
+                collect_let_vars(&arg.value, line_numbers, vars);
+            }
+        }
+        TypedExpr::UnOp { value, .. } => {
+            collect_let_vars(value, line_numbers, vars);
+        }
+        _ => {}
+    }
+}
+
+fn build_selection_range(
+    node: &Located<'_>,
+    line_numbers: &LineNumbers,
+    source: &str,
+) -> lsp_types::SelectionRange {
+    use aiken_lang::ast::Span;
+
+    fn name_span(source: &str, span: Span, name: &str) -> Option<Span> {
+        let text = &source[span.start..span.end];
+        let offset = text.find(name)?;
+        Some(Span {
+            start: span.start + offset,
+            end: span.start + offset + name.len(),
+        })
+    }
+
+    let (full_span, def_name) = match node {
+        Located::Definition(def) => {
+            use aiken_lang::ast::Definition;
+            let name = match def {
+                Definition::Fn(f) => Some(&f.name[..]),
+                Definition::DataType(dt) => Some(&dt.name[..]),
+                Definition::TypeAlias(ta) => Some(&ta.alias[..]),
+                Definition::ModuleConstant(c) => Some(&c.name[..]),
+                Definition::Validator(v) => Some(&v.name[..]),
+                Definition::Test(t) => Some(&t.name[..]),
+                Definition::Benchmark(b) => Some(&b.name[..]),
+                Definition::Use(_) => None,
+            };
+            (def.location(), name)
+        }
+        Located::Expression(expr) => {
+            use aiken_lang::expr::TypedExpr;
+            let name = match expr {
+                TypedExpr::Var { name, .. } => Some(name.as_str()),
+                _ => None,
+            };
+            (expr.location(), name)
+        }
+        Located::Pattern(pat, _) => (pat.location(), None),
+        Located::Argument(arg, _) => (arg.location(), None),
+        Located::Annotation(ann) => (ann.location(), None),
+    };
+
+    let full_range = span_to_lsp_range(full_span, line_numbers);
+
+    if let Some(name) = def_name
+        && let Some(name_span) = name_span(source, full_span, name)
+    {
+        let name_range = span_to_lsp_range(name_span, line_numbers);
+        lsp_types::SelectionRange {
+            range: name_range,
+            parent: Some(Box::new(lsp_types::SelectionRange {
+                range: full_range,
+                parent: None,
+            })),
+        }
+    } else {
+        lsp_types::SelectionRange {
+            range: full_range,
+            parent: None,
+        }
     }
 }

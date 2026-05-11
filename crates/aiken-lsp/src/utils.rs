@@ -39,13 +39,8 @@ pub fn text_edit_replace(new_text: String) -> TextEdit {
 
 #[allow(clippy::result_large_err)]
 pub fn path_to_uri(path: PathBuf) -> Result<lsp_types::Url, Error> {
-    let mut file: String = "file://".into();
-
-    file.push_str(&path.as_os_str().to_string_lossy());
-
-    let uri = lsp_types::Url::parse(&file)?;
-
-    Ok(uri)
+    lsp_types::Url::from_file_path(&path)
+        .map_err(|_| Error::UriError(path.to_string_lossy().to_string()))
 }
 
 pub fn span_to_lsp_range(location: Span, line_numbers: &LineNumbers) -> lsp_types::Range {
