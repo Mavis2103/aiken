@@ -268,7 +268,9 @@ impl Server {
             return;
         }
 
-        let _ = self.pending_compile.take();
+        if let Some(handle) = self.pending_compile.take() {
+            let _ = handle.join();
+        }
         if let Some(config) = self.config.clone() {
             let root = self.root.clone();
             let edited = self.edited.clone();
@@ -330,6 +332,7 @@ impl Server {
                         message: "Background compilation crashed — please save again to retry"
                             .to_string(),
                     });
+                    self.notify_client_of_compilation_end(connection)?;
                 }
             }
             self.publish_stored_diagnostics(connection)?;
@@ -1966,8 +1969,7 @@ impl Server {
                     None => return Ok(None),
                 };
 
-                let url =
-                    url::Url::from_file_path(&module.path).expect("goto definition URL parse");
+                let url = url::Url::from_file_path(&module.path).ok()?;
 
                 (url, &module.line_numbers)
             }
@@ -1998,7 +2000,7 @@ impl Server {
 
     pub(crate) fn module_for_uri(&self, uri: &url::Url) -> Option<&CheckedModule> {
         self.compiler.as_ref().and_then(|compiler| {
-            let module_name = uri_to_module_name(uri, &self.root).expect("uri to module name");
+            let module_name = uri_to_module_name(uri, &self.root)?;
             compiler.modules.get(&module_name)
         })
     }
