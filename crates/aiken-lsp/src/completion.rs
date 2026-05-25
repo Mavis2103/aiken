@@ -30,9 +30,6 @@ impl Server {
                     compiler.project.importable_modules(),
                     &[],
                 );
-                // If a module is resolved for this URI, the cursor is inside a known file.
-                // Prefer expression keywords since blank lines inside function bodies are
-                // a common trigger point; top-level keywords only make sense at the file root.
                 if module.is_some() {
                     items.extend(expression_keywords());
                 } else {
@@ -149,14 +146,11 @@ fn completion_for_pattern(
 ) -> Option<Vec<CompletionItem>> {
     let mut items = Vec::new();
 
-    // Extract the bare type name (e.g. "Option" not "Option<Int>") for the
-    // types_constructors lookup, which is keyed by bare name.
+    // Extract the bare type name for the types_constructors lookup (keyed by bare name,
+    // not pretty-printed form like "Option<Int>").
     let type_name = match tipo.as_ref() {
         aiken_lang::tipo::Type::App { name, .. } => name.clone(),
-        _ => {
-            // Non-nominal type (Fn, Var, Tuple) has no constructors
-            return Some(items);
-        }
+        _ => return Some(items),
     };
 
     if let Some(constructor_names) = type_info.types_constructors.get(&type_name) {

@@ -1969,7 +1969,10 @@ impl Server {
                     None => return Ok(None),
                 };
 
-                let url = url::Url::from_file_path(&module.path).ok()?;
+                let url = match url::Url::from_file_path(&module.path) {
+                    Ok(url) => url,
+                    Err(()) => return Ok(None),
+                };
 
                 (url, &module.line_numbers)
             }

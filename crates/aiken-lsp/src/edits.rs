@@ -25,12 +25,12 @@ pub fn parse_document(
     document: &lsp_types::TextDocumentIdentifier,
     edited: &HashMap<String, String>,
 ) -> Option<ParsedDocument> {
-    let uri_path = document.uri.path().to_string();
     let file_path = document
         .uri
         .to_file_path()
         .expect("invalid text document uri?");
 
+    let uri_path = document.uri.path().to_string();
     let source_code = match edited.get(&uri_path) {
         Some(content) => content.clone(),
         None => fs::read_to_string(&file_path).ok()?,
